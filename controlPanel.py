@@ -6,8 +6,6 @@ class GenerationInfo:
 
     territorySize = 100
 
-    territoryVisionRange = 20
-
     mapSizeScalar = 1.5
 
 

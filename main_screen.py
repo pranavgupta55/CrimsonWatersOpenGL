@@ -12,7 +12,15 @@ import queue
 import threading
 import string
 import random
+import math
 
+# --- MODERNGL IMPORTS ---
+import moderngl
+import numpy as np
+import cloud_manager
+from visual_config import *
+
+# --- GAME IMPORTS ---
 from text import drawText
 from fontDict import fonts as fonts_definitions
 from controlPanel import GenerationInfo, ResourceInfo, StructureInfo, Cols, uiInfo
@@ -171,6 +179,7 @@ load_and_calculate_average_times()
 
 
 def build_tile_handler_worker(args_tuple):
+    # Unpack args
     map_width, map_height, viewport_width, viewport_height, gen_info, font_name_to_load, font_definitions_dict, cols_class, resource_info_class, structure_info_class, local_status_q, current_preset_times, worker_seed = args_tuple
 
     try:
@@ -179,17 +188,30 @@ def build_tile_handler_worker(args_tuple):
         if local_status_q:
             local_status_q.put_nowait(("Error: Import Failed in Worker (TileHandler)", "ERROR", str(e_import)))
         raise
+
     _font = None
-    if font_name_to_load and font_name_to_load in font_definitions_dict:
-        try:
-            pygame.init()
-            font_path, font_size = font_definitions_dict[font_name_to_load]
-            _font = pygame.font.Font(font_path, font_size)
-        except Exception as e_font:
-            print(f"Worker: Error loading font '{font_name_to_load}': {e_font}")
-    TH_instance = TileHandler(map_width, map_height, gen_info.tileSize, cols_class, gen_info.waterThreshold, gen_info.mountainThreshold, gen_info.territorySize, font=_font, font_name=font_name_to_load, resource_info=resource_info_class, structure_info=structure_info_class, status_queue=local_status_q, preset_times=current_preset_times, seed=worker_seed, viewport_width=viewport_width, viewport_height=viewport_height)
-    TH_instance.prepare_for_pickling()
-    return TH_instance
+
+    TH_instance = TileHandler(
+        map_width, map_height, gen_info.tileSize, cols_class,
+        gen_info.waterThreshold, gen_info.mountainThreshold, gen_info.territorySize,
+        font=_font, font_name=font_name_to_load,
+        resource_info=resource_info_class, structure_info=structure_info_class,
+        status_queue=local_status_q, preset_times=current_preset_times,
+        seed=worker_seed, viewport_width=viewport_width, viewport_height=viewport_height
+    )
+
+    # Run the generation sequence
+    TH_instance.run_generation_sequence()
+
+    # Return the data payload, NOT the object
+    return TH_instance.prepare_payload()
+
+
+# --- MODERNGL HELPER ---
+def load_shader(ctx, vert, frag):
+    with open(vert, 'r') as f: v = f.read()
+    with open(frag, 'r') as f: fr = f.read()
+    return ctx.program(vertex_shader=v, fragment_shader=fr)
 
 
 if __name__ == "__main__":
@@ -201,14 +223,120 @@ if __name__ == "__main__":
 
     pygame.init()
 
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    # --- GL SETUP ---
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG, True)
+
+    # 1. Get Native Resolution
+    info = pygame.display.Info()
+    WINDOW_WIDTH = info.current_w
+    WINDOW_HEIGHT = info.current_h
+    aspect = WINDOW_WIDTH / WINDOW_HEIGHT
+
+    # 2. Set internal resolutions based on aspect ratio
+    INT_GAME_RENDER_W = int(GAME_RENDER_H * aspect)
+    INT_GAME_RENDER_H = GAME_RENDER_H
+    INT_CLOUD_RENDER_W = int(CLOUD_RENDER_H * aspect)
+    INT_CLOUD_RENDER_H = CLOUD_RENDER_H
+
+    # 3. Fullscreen Window
+    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT),
+                                     pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
+    ctx = moderngl.create_context()
+    ctx.enable(moderngl.BLEND)
+    ctx.blend_func = moderngl.DEFAULT_BLENDING
+
+    # --- GL RESOURCES ---
+
+    # Surfaces
+    surf_game = pygame.Surface((INT_GAME_RENDER_W, INT_GAME_RENDER_H))
+    surf_ui = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+
+    # Textures
+    tex_game = ctx.texture((INT_GAME_RENDER_W, INT_GAME_RENDER_H), 3)
+    tex_game.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+    tex_ui = ctx.texture((WINDOW_WIDTH, WINDOW_HEIGHT), 4)
+    tex_ui.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    # FBOs
+    tex_cloud_color = ctx.texture((INT_CLOUD_RENDER_W, INT_CLOUD_RENDER_H), 4)
+    tex_cloud_color.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    tex_cloud_color.repeat_x = False
+    tex_cloud_color.repeat_y = False
+
+    fbo_clouds = ctx.framebuffer(color_attachments=[tex_cloud_color])
+
+    tex_composite = ctx.texture((INT_GAME_RENDER_W, INT_GAME_RENDER_H), 3)
+    tex_composite.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    fbo_composite = ctx.framebuffer(color_attachments=[tex_composite])
+
+    # Shaders
+    prog_clouds = load_shader(ctx, 'shaders/cloud_layer.vert', 'shaders/cloud_layer.frag')
+    prog_comp = load_shader(ctx, 'shaders/basic.vert', 'shaders/final_composite.frag')
+    prog_post = load_shader(ctx, 'shaders/basic.vert', 'shaders/post_high.frag')
+    prog_ui = load_shader(ctx, 'shaders/basic.vert', 'shaders/ui_overlay.frag')
+
+    # Setup Cloud Palette
+    palette_flat = [c / 255.0 for col in CLOUD_PALETTE for c in col]
+    if 'u_palette' in prog_clouds:
+        prog_clouds['u_palette'].write(struct.pack(f'{len(palette_flat)}f', *palette_flat))
+
+    # Init Cloud Manager with render resolution
+    clouds = cloud_manager.CloudManager(INT_CLOUD_RENDER_W, INT_CLOUD_RENDER_H)
+
+    # Buffers
+    quad_data = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype='f4')
+    vbo_quad = ctx.buffer(quad_data)
+    vbo_instances = ctx.buffer(reserve=CLOUD_COUNT * 7 * 4)
+
+    # VAOs
+    vao_clouds = ctx.vertex_array(prog_clouds, [(vbo_quad, '2f', 'in_vert'),
+                                                (vbo_instances, '4f 3f /i', 'in_pos_z_rad', 'in_squash_seed_res')])
+
+    vbo_fs = ctx.buffer(struct.pack('16f', -1, 1, 0, 1, -1, -1, 0, 0, 1, 1, 1, 1, 1, -1, 1, 0))
+    vao_comp = ctx.vertex_array(prog_comp, [(vbo_fs, '2f 2f', 'in_vert', 'in_texcoord')])
+    vao_post = ctx.vertex_array(prog_post, [(vbo_fs, '2f 2f', 'in_vert', 'in_texcoord')])
+    vao_ui = ctx.vertex_array(prog_ui, [(vbo_fs, '2f 2f', 'in_vert', 'in_texcoord')])
+
+    # Uniforms - Clouds
+    prog_clouds['u_resolution'].value = (INT_CLOUD_RENDER_W, INT_CLOUD_RENDER_H)
+    prog_clouds['u_layer_offset_x'].value = CLOUD_LAYER_OFFSET_X
+    prog_clouds['u_layer_offset_y'].value = CLOUD_LAYER_OFFSET_Y
+    prog_clouds['u_layer_var_y'].value = CLOUD_LAYER_OFFSET_VARIANCE_Y
+    prog_clouds['u_layer_dec'].value = CLOUD_LAYER_SIZE_DECREASE
+    prog_clouds['u_layer_dec_var'].value = CLOUD_LAYER_SIZE_DECREASE_VARIANCE
+    prog_clouds['u_wander_speed'].value = CLOUD_WANDER_SPEED
+    prog_clouds['u_wander_strength'].value = CLOUD_WANDER_STRENGTH
+    prog_clouds['u_pulse_speed'].value = CLOUD_PULSE_SPEED
+    prog_clouds['u_pulse_var'].value = CLOUD_PULSE_VARIANCE
+
+    # Uniforms - Composite
+    prog_comp['u_map'].value = 0
+    prog_comp['u_clouds'].value = 1
+    prog_comp['u_godray_intensity'].value = GODRAY_INTENSITY
+    prog_comp['u_godray_decay'].value = GODRAY_DECAY
+    prog_comp['u_godray_weight'].value = GODRAY_WEIGHT
+    prog_comp['u_godray_density'].value = GODRAY_DENSITY
+    prog_comp['u_godray_samples'].value = GODRAY_SAMPLES
+
+    # Uniforms - Post
+    prog_post['u_scene'].value = 0
+    prog_post['u_bloom_intensity'].value = BLOOM_INTENSITY
+    prog_post['u_vig_strength'].value = VIGNETTE_STRENGTH
+    prog_post['u_vig_radius'].value = VIGNETTE_RADIUS
+    prog_post['u_vig_softness'].value = VIGNETTE_SOFTNESS
+
+    # Uniforms - UI
+    prog_ui['u_ui'].value = 0
+
+    # --- MAIN LOOP SETUP ---
     clock = pygame.time.Clock()
     fps = 60
-    screen_width, screen_height = screen.get_width(), screen.get_height()
+    screen_width, screen_height = WINDOW_WIDTH, WINDOW_HEIGHT
     screen_center = [screen_width / 2, screen_height / 2]
-
-    screen2_loading_background = pygame.Surface((screen_width, screen_height)).convert_alpha()
-    screenUI = pygame.Surface((screen_width, screen_height)).convert_alpha()
 
     loaded_fonts = {}
     for name, (path, size) in fonts_definitions.items():
@@ -228,7 +356,8 @@ if __name__ == "__main__":
 
     player = None
 
-    generationScreenBackgroundImg = pygame.transform.scale(pygame.image.load("assets/UI/LoadingPageBackground.png"), (screen_width, screen_height))
+    generationScreenBackgroundImg = pygame.transform.scale(pygame.image.load("assets/UI/LoadingPageBackground.png"),
+                                                           (screen_width, screen_height))
 
     manager = multiprocessing.Manager()
     status_queue_for_main_thread = manager.Queue()
@@ -254,8 +383,8 @@ if __name__ == "__main__":
 
     seed_to_send = None
     seed = None
-    requestSentTime = None
 
+    requestSentTime = None
     target_host_ip = None
     target_host_port = None
 
@@ -280,25 +409,33 @@ if __name__ == "__main__":
     PHASE_RETRIEVING_MAP_DATA = "Retrieving World Data"
     PHASE_GFX_INIT = "Initializing Graphics"
 
-    LOADING_STEPS_ORDER = ["tileGen", "linkAdj", "generationCycles", "setTileColors", "cloudPrecompParallel", "findLandRegionsParallel", "indexOceansParallel", "assignCoastTiles", "createTerritories", "connectHarborsParallel", "precomputeTerritoryVision", "workerInit", "dataSerialization", "retrieveMapData", "gfxTotalInit"]
-
-    # This list defines which steps contribute to the main progress bar.
-    # Excludes workerInit (summary) and main thread tasks (retrieveMapData, gfxTotalInit)
-    LOADING_STEPS_FOR_PROGRESS_BAR = ["tileGen", "linkAdj", "generationCycles", "setTileColors", "cloudPrecompParallel", "findLandRegionsParallel", "indexOceansParallel", "assignCoastTiles", "createTerritories", "connectHarborsParallel", "precomputeTerritoryVision", "dataSerialization"]
-
-    DISPLAY_NAMES_MAP = {"tileGen": "Generating Tiles", "linkAdj": "Connecting Adjacent Tiles", "cloudPrecompParallel": "Precomp Cloud Patterns (Parallel)", "generationCycles": "Simulating Biomes (50 cycles)", "setTileColors": "Coloring Map Tiles", "findLandRegionsParallel": "Identifying Landmasses (Parallel)", "indexOceansParallel": "Indexing Oceans (Parallel)", "assignCoastTiles": "Assigning Coastline Tiles", "createTerritories": "Forming Territories",
-                         "connectHarborsParallel": "Connecting Harbors (Parallel)", "precomputeTerritoryVision": "Precomputing Territory Vision", "workerInit": "World Generation Complete (Worker)", "dataSerialization": "Serializing World Data", "retrieveMapData": "Retrieving World Data", "gfxTotalInit": "Initializing Game Graphics"}
+    LOADING_STEPS_ORDER = ["tileGen", "linkAdj", "generationCycles", "setTileColors", "findLandRegionsParallel",
+                           "indexOceansParallel", "assignCoastTiles", "createTerritories", "connectHarborsParallel",
+                           "workerInit", "dataSerialization", "retrieveMapData", "gfxTotalInit"]
+    LOADING_STEPS_FOR_PROGRESS_BAR = ["tileGen", "linkAdj", "generationCycles", "setTileColors",
+                                      "findLandRegionsParallel", "indexOceansParallel", "assignCoastTiles",
+                                      "createTerritories", "connectHarborsParallel", "dataSerialization"]
+    DISPLAY_NAMES_MAP = {"tileGen": "Generating Tiles", "linkAdj": "Connecting Adjacent Tiles",
+                         "generationCycles": "Simulating Biomes (50 cycles)", "setTileColors": "Coloring Map Tiles",
+                         "findLandRegionsParallel": "Identifying Landmasses (Parallel)",
+                         "indexOceansParallel": "Indexing Oceans (Parallel)",
+                         "assignCoastTiles": "Assigning Coastline Tiles", "createTerritories": "Forming Territories",
+                         "connectHarborsParallel": "Connecting Harbors (Parallel)",
+                         "workerInit": "World Generation Complete (Worker)",
+                         "dataSerialization": "Serializing World Data", "retrieveMapData": "Retrieving World Data",
+                         "gfxTotalInit": "Initializing Game Graphics"}
 
     task_display_states = {}
     for step_name_key in LOADING_STEPS_ORDER:
-        task_display_states[step_name_key] = {'status': 'Pending', 'start_time': 0.0, 'duration': 0.0, 'expected_time': PRESET_EXECUTION_TIMES.get(step_name_key, INITIAL_PRESET_PLACEHOLDER_TIME)}
+        task_display_states[step_name_key] = {'status': 'Pending', 'start_time': 0.0, 'duration': 0.0,
+                                              'expected_time': PRESET_EXECUTION_TIMES.get(step_name_key,
+                                                                                          INITIAL_PRESET_PLACEHOLDER_TIME)}
 
-    # Calculate total expected loading time for the new progress bar
     total_expected_loading_time = 0.0
     for step_name_key in LOADING_STEPS_FOR_PROGRESS_BAR:
         total_expected_loading_time += task_display_states[step_name_key]['expected_time']
     if total_expected_loading_time == 0.0:
-        total_expected_loading_time = 20.0  # Fallback value if all expected times are zero (e.g., first run with all placeholders at 0.1)
+        total_expected_loading_time = 20.0
 
     loading_screen_start_time = time.time()
 
@@ -325,15 +462,15 @@ if __name__ == "__main__":
     running = True
     pygame.mouse.set_visible(False)
 
-    screen2_loading_background.blit(generationScreenBackgroundImg, (0, 0))
     overlay = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)
     overlay.fill((0, 8, 10, 150))
-    screen2_loading_background.blit(overlay, (0, 0))
-    screen.blit(screen2_loading_background, (0, 0))
 
     while running:
-        screen.fill(Cols.dark)
-        screenUI.fill((0, 0, 0, 0))
+        # 1. Clear UI Surface & Draw Background
+        surf_ui.fill((0, 0, 0, 0))
+        surf_ui.blit(generationScreenBackgroundImg, (0, 0))
+        surf_ui.blit(overlay, (0, 0))
+
         dt = time.time() - last_time
         dt *= fps
         last_time = time.time()
@@ -341,6 +478,7 @@ if __name__ == "__main__":
 
         lobby_timer_for_error_display -= 1 * dt
 
+        # --- NETWORKING QUEUE PROCESSING ---
         try:
             while not MSG_QUEUE.empty():
                 addr, msg = MSG_QUEUE.get_nowait()
@@ -371,13 +509,14 @@ if __name__ == "__main__":
         except Exception as e_queue_process:
             print(f"Main Error processing network queue: {e_queue_process}")
 
+        # --- EVENT HANDLING ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                click = True
+                pass
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                click = False
+                pass
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -398,7 +537,9 @@ if __name__ == "__main__":
                             connectingPort = find_free_port(connectingPort)
                             server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                             server_socket.bind(("0.0.0.0", connectingPort))
-                            server_thread_instance = threading.Thread(target=server_thread, args=(server_socket, "0.0.0.0", connectingPort), daemon=True)
+                            server_thread_instance = threading.Thread(target=server_thread,
+                                                                      args=(server_socket, "0.0.0.0", connectingPort),
+                                                                      daemon=True)
                             server_thread_instance.start()
 
                             mode = "HOST_LOBBY"
@@ -484,6 +625,7 @@ if __name__ == "__main__":
                 if event.key == pygame.K_LSHIFT or event.key == pygame.K_RSHIFT:
                     shifting = False
 
+        # --- KEYBOARD INPUT LOGIC ---
         for key, hold_time in list(keyHoldFrames.items()):
             keyHoldFrames[key] += 1
             if hold_time == 0 or hold_time > delayThreshold:
@@ -503,6 +645,7 @@ if __name__ == "__main__":
                 if hold_time > delayThreshold:
                     keyHoldFrames[key] = delayThreshold
 
+        # --- NETWORK TIMEOUT CHECKS ---
         if mode != "IN_GAME":
             if mode == "CLIENT_LOBBY" and joined:
                 if time.time() - last_ping_sent_time > client_ping_interval:
@@ -543,59 +686,94 @@ if __name__ == "__main__":
                     del client_last_ping_time[addr_to_remove]
                 last_host_check_time = time.time()
 
+            # --- LOBBY RENDERING ---
             if mode == "INIT":
-                drawText(screenUI, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 80, "Crimson", Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
-                drawText(screenUI, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] + 80, "Wakes", Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
+                drawText(surf_ui, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 80, "Crimson",
+                         Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
+                drawText(surf_ui, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] + 80, "Wakes", Cols.dark,
+                         shadowSize=5, justify="center", centeredVertically=True)
                 if lobby_timer_for_error_display < 0:
                     blink_char = '~' if int(lobby_timer_for_error_display / fps * 2) % 2 else ' '
                     userStringErrorDisplay = (f"-> {blink_char} <-" if userString == "" else None)
                 prompt = "type 'start' to host or enter a code to join"
-                drawText(screenUI, Cols.light, Alkhemikal50, screen_width * 0.75, screen_center[1] - 40, prompt, Cols.dark, 3, justify="middle", centeredVertically=True, maxLen=screen_width / 3, wrap=True)
-                drawText(screenUI, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light, Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_width * 0.75, screen_center[1] + 100, userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal50, screen_width * 0.75, screen_center[1] - 40, prompt,
+                         Cols.dark, 3, justify="middle", centeredVertically=True, maxLen=screen_width / 3, wrap=True)
+                drawText(surf_ui, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light,
+                         Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_width * 0.75,
+                         screen_center[1] + 100,
+                         userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3,
+                         justify="middle", centeredVertically=True)
 
             elif mode == "HOST_LOBBY":
-                drawText(screenUI, Cols.crimson, Alkhemikal150, screen_center[0], screen_center[1] - 260, "HOST LOBBY", Cols.dark, 3, justify="middle", centeredVertically=True)
-                drawText(screenUI, Cols.light, Alkhemikal80, screen_center[0], screen_center[1] - 160, f"Room code: {room_code}", Cols.dark, 3, justify="middle", centeredVertically=True)
-                drawText(screenUI, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 100, f"Players joined:", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.crimson, Alkhemikal150, screen_center[0], screen_center[1] - 260, "HOST LOBBY",
+                         Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal80, screen_center[0], screen_center[1] - 160,
+                         f"Room code: {room_code}", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 100,
+                         f"Players joined:", Cols.dark, 3, justify="middle", centeredVertically=True)
 
                 current_players_list = list(players.values())
-                drawText(screenUI, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 90 + 1 * 25, f"{username} (You)", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 90 + 1 * 25,
+                         f"{username} (You)", Cols.dark, 3, justify="middle", centeredVertically=True)
                 for i, name in enumerate(current_players_list, start=2):
-                    drawText(screenUI, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 90 + i * 25, name, Cols.dark, 3, justify="middle", centeredVertically=True)
+                    drawText(surf_ui, Cols.light, Alkhemikal20, screen_center[0], screen_center[1] - 90 + i * 25, name,
+                             Cols.dark, 3, justify="middle", centeredVertically=True)
 
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_center[0], screen_center[1] + 280, "type 'begin' to start or 'quit' to exit", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_center[0], screen_center[1] + 280,
+                         "type 'begin' to start or 'quit' to exit", Cols.dark, 3, justify="middle",
+                         centeredVertically=True)
 
                 if lobby_timer_for_error_display < 0:
                     blink_char = '~' if int(lobby_timer_for_error_display / fps * 2) % 2 else ' '
                     userStringErrorDisplay = (f"-> {blink_char} <-" if userString == "" else None)
-                drawText(screenUI, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light, Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_center[0], screen_center[1] + 180, userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light,
+                         Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_center[0],
+                         screen_center[1] + 180,
+                         userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3,
+                         justify="middle", centeredVertically=True)
 
             elif mode == "CLIENT_LOBBY":
-                drawText(screenUI, Cols.light, Alkhemikal50, screen_center[0], screen_center[1] - 100, "CLIENT LOBBY", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal50, screen_center[0], screen_center[1] - 100, "CLIENT LOBBY",
+                         Cols.dark, 3, justify="middle", centeredVertically=True)
                 status = "JOINED! waiting for host..." if joined else "joining..."
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_center[0], screen_center[1], status, Cols.dark, 3, justify="middle", centeredVertically=True)
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_center[0], screen_center[1] + 180, "type 'quit' to exit", Cols.dark, 3, justify="middle", centeredVertically=True)
-                drawText(screenUI, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light, Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_center[0], screen_center[1] + 80, userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_center[0], screen_center[1], status, Cols.dark, 3,
+                         justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_center[0], screen_center[1] + 180,
+                         "type 'quit' to exit", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.crimson if lobby_timer_for_error_display > 0 else Cols.light,
+                         Alkhemikal80 if userStringErrorDisplay else Alkhemikal200, screen_center[0],
+                         screen_center[1] + 80,
+                         userString if userStringErrorDisplay is None else userStringErrorDisplay, Cols.dark, 3,
+                         justify="middle", centeredVertically=True)
 
             if toggle:
                 string_fps = f"FPS: {round(clock.get_fps())}"
-                drawText(screenUI, Cols.crimson, Alkhemikal30, 5, screen_height - 30, string_fps, Cols.dark, 3, antiAliasing=False)
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark, 3, justify="middle", centeredVertically=True)
-                pygame.draw.circle(screenUI, Cols.dark, (mx + 2, my + 2), 7, 2)
-                pygame.draw.circle(screenUI, Cols.light, (mx, my), 7, 2)
+                drawText(surf_ui, Cols.crimson, Alkhemikal30, 5, screen_height - 30, string_fps, Cols.dark, 3,
+                         antiAliasing=False)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark,
+                         3, justify="middle", centeredVertically=True)
+                pygame.draw.circle(surf_ui, Cols.dark, (mx + 2, my + 2), 7, 2)
+                pygame.draw.circle(surf_ui, Cols.light, (mx, my), 7, 2)
 
-            screen.blit(screen2_loading_background, (0, 0))
-            screen.blit(overlay, (0, 0))
-            screen.blit(screenUI, (0, 0))
+            # FLUSH LOBBY RENDER TO SCREEN
+            ctx.screen.use()
+            ctx.clear(0, 0, 0, 1)
+            tex_ui.write(pygame.image.tobytes(surf_ui, 'RGBA'))
+            tex_ui.use(location=0)
+            vao_ui.render(moderngl.TRIANGLE_STRIP)
             pygame.display.flip()
             clock.tick(fps)
             continue
 
+        # --- GENERATION START ---
         if future is None:
             print(f"Main: Submitting TileHandler generation task to worker with seed: {seed}.")
-            map_gen_width = int(screen_width * GenerationInfo.mapSizeScalar)
-            map_gen_height = int(screen_height * GenerationInfo.mapSizeScalar)
-            worker_args = (map_gen_width, map_gen_height, screen_width, screen_height, GenerationInfo, font_name_needed_by_worker, fonts_definitions, Cols, ResourceInfo, StructureInfo, status_queue_for_main_thread, PRESET_EXECUTION_TIMES, seed)
+            map_gen_width = int(MAP_GENERATION_WIDTH * GenerationInfo.mapSizeScalar)
+            map_gen_height = int(MAP_GENERATION_HEIGHT * GenerationInfo.mapSizeScalar)
+
+            worker_args = (map_gen_width, map_gen_height, screen_width, screen_height, GenerationInfo,
+                           font_name_needed_by_worker, fonts_definitions, Cols, ResourceInfo, StructureInfo,
+                           status_queue_for_main_thread, PRESET_EXECUTION_TIMES, seed)
             future = executor.submit(build_tile_handler_worker, worker_args)
             loading_screen_start_time = time.time()
 
@@ -603,18 +781,44 @@ if __name__ == "__main__":
             numPeriods = (numPeriods + 3 / fps) % 4
 
             if not worker_tasks_complete and future.done() and not retrieving_result_active:
+                print(f"[DEBUG_TIMING] Future Done detected at {time.time()}")
                 worker_tasks_complete = True
                 retrieving_result_active = True
                 task_data = task_display_states["retrieveMapData"]
                 task_data['status'] = 'Starting'
                 task_data['start_time'] = time.time()
-                task_data['expected_time'] = PRESET_EXECUTION_TIMES.get("retrieveMapData", INITIAL_PRESET_PLACEHOLDER_TIME)
+                task_data['expected_time'] = PRESET_EXECUTION_TIMES.get("retrieveMapData",
+                                                                        INITIAL_PRESET_PLACEHOLDER_TIME)
 
             elif retrieving_result_active:
-                actual_retrieval_start_time = time.time()
+                # DEBUG: Start Timer
+                t0 = time.perf_counter()
                 try:
-                    TH = future.result()
-                    retrieval_duration = time.time() - actual_retrieval_start_time
+                    print(f"[DEBUG] Calling future.result() at {time.time()}...")
+                    payload = future.result()
+                    t1 = time.perf_counter()
+                    print(f"[DEBUG] payload retrieved in {t1 - t0:.4f}s")
+
+                    # Reconstruct TH on Main Thread
+                    from generation import TileHandler
+
+                    # Init empty TH
+                    TH = TileHandler(
+                        payload['mapWidth'], payload['mapHeight'],
+                        GenerationInfo.tileSize, Cols,
+                        GenerationInfo.waterThreshold, GenerationInfo.mountainThreshold, GenerationInfo.territorySize,
+                        font=None, font_name=None,
+                        resource_info=ResourceInfo, structure_info=StructureInfo,
+                        viewport_width=payload['viewportWidth'], viewport_height=payload['viewportHeight']
+                    )
+
+                    TH.reconstruct_from_payload(payload, loaded_fonts, status_queue_for_main_thread,
+                                                PRESET_EXECUTION_TIMES)
+
+                    t2 = time.perf_counter()
+                    print(f"[DEBUG] reconstruction took {t2 - t1:.4f}s")
+
+                    retrieval_duration = t1 - t0
                     all_current_run_times["retrieveMapData"] = retrieval_duration
 
                     task_data = task_display_states["retrieveMapData"]
@@ -626,22 +830,16 @@ if __name__ == "__main__":
                     if TH and hasattr(TH, 'execution_times'):
                         all_current_run_times.update(TH.execution_times)
 
-                    task_data_gfx_total = task_display_states["gfxTotalInit"]
-                    task_data_gfx_total['status'] = 'Starting'
-                    task_data_gfx_total['start_time'] = time.time()
-                    task_data_gfx_total['expected_time'] = PRESET_EXECUTION_TIMES.get("gfxTotalInit", INITIAL_PRESET_PLACEHOLDER_TIME)
-
-                    if TH:
-                        TH.initialize_graphics_and_external_libs(loaded_fonts, status_queue_for_main_thread, PRESET_EXECUTION_TIMES)
-                    else:
-                        task_data = task_display_states["retrieveMapData"]
-                        task_data['status'] = 'Error'
-                        task_data['duration'] = 0.0
-                        TH_fully_initialized = True
-                        print("Main Error: TH is None after future.result().")
+                    TH_fully_initialized = True
 
                 except Exception as e_future_result:
-                    retrieval_duration = time.time() - actual_retrieval_start_time
+                    t_err = time.perf_counter()
+                    print(f"[DEBUG] Error retrieving result: {e_future_result} (Time: {t_err - t0:.4f}s)")
+                    import traceback
+
+                    traceback.print_exc()
+
+                    retrieval_duration = t_err - t0
                     all_current_run_times["retrieveMapData (Error)"] = retrieval_duration
 
                     task_data = task_display_states["retrieveMapData"]
@@ -655,10 +853,12 @@ if __name__ == "__main__":
                 while not status_queue_for_main_thread.empty():
                     step_name_key_from_worker, status_type, time_value = status_queue_for_main_thread.get_nowait()
 
-                    display_name_human_readable = DISPLAY_NAMES_MAP.get(step_name_key_from_worker, step_name_key_from_worker)
+                    display_name_human_readable = DISPLAY_NAMES_MAP.get(step_name_key_from_worker,
+                                                                        step_name_key_from_worker)
 
                     if step_name_key_from_worker not in task_display_states:
-                        print(f"Main: Received unknown task status key: '{step_name_key_from_worker}' (mapped to '{display_name_human_readable}'). Please check config.")
+                        print(
+                            f"Main: Received unknown task status key: '{step_name_key_from_worker}' (mapped to '{display_name_human_readable}'). Please check config.")
                         continue
 
                     current_task_data = task_display_states[step_name_key_from_worker]
@@ -674,12 +874,12 @@ if __name__ == "__main__":
                     elif status_type == "FINISHED":
                         current_task_data['status'] = 'Finished'
                         current_task_data['duration'] = time_value
-                        if step_name_key_from_worker == "gfxTotalInit":
-                            TH_fully_initialized = True
+                        # gfxTotalInit is handled differently here since it runs on main thread now
                     elif status_type == "ERROR":
                         current_task_data['status'] = 'Error'
                         current_task_data['duration'] = 0.0
-                        print(f"Main (Error from queue): Task '{display_name_human_readable}' failed - Details: {time_value}")
+                        print(
+                            f"Main (Error from queue): Task '{display_name_human_readable}' failed - Details: {time_value}")
                         TH_fully_initialized = True
             except (multiprocessing.queues.Empty, EOFError):
                 pass
@@ -687,11 +887,11 @@ if __name__ == "__main__":
                 print(f"Main: Error processing status queue: {e_queue}")
                 TH_fully_initialized = True
 
-            screen.blit(screen2_loading_background, (0, 0))
-            screen.blit(overlay, (0, 0))
-
-            drawText(screenUI, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 150, "Crimson", Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
-            drawText(screenUI, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 10, "Wakes", Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
+            # --- RENDER LOADING SCREEN ---
+            drawText(surf_ui, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 150, "Crimson", Cols.dark,
+                     shadowSize=5, justify="center", centeredVertically=True)
+            drawText(surf_ui, Cols.crimson, Alkhemikal200, main_title_x, screen_center[1] - 10, "Wakes", Cols.dark,
+                     shadowSize=5, justify="center", centeredVertically=True)
 
             current_overall_phase = PHASE_WORKER_INIT
             if task_display_states["gfxTotalInit"]['status'] in ['Starting', 'Sent', 'Finished', 'Error']:
@@ -707,7 +907,8 @@ if __name__ == "__main__":
             elif TH_fully_initialized and not TH:
                 top_loading_text = "Generation Error"
 
-            drawText(screenUI, Cols.light, Alkhemikal50, main_overall_phase_x, screen_center[1] + 90, top_loading_text, Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
+            drawText(surf_ui, Cols.light, Alkhemikal50, main_overall_phase_x, screen_center[1] + 90, top_loading_text,
+                     Cols.dark, shadowSize=5, justify="center", centeredVertically=True)
 
             y_pos_offset = 0
             for task_name_key in LOADING_STEPS_ORDER:
@@ -749,14 +950,16 @@ if __name__ == "__main__":
                     show_progress_bar = False
 
                 if Alkhemikal20:
-                    drawText(screenUI, Cols.light, Alkhemikal20, tasks_list_x, task_y_pos, display_name_human_readable, Cols.dark, shadowSize=2, justify="left")
-                    drawText(screenUI, Cols.light, Alkhemikal20, screen_width - 10, task_y_pos, infoText, Cols.dark, shadowSize=2, justify="right")
+                    drawText(surf_ui, Cols.light, Alkhemikal20, tasks_list_x, task_y_pos, display_name_human_readable,
+                             Cols.dark, shadowSize=2, justify="left")
+                    drawText(surf_ui, Cols.light, Alkhemikal20, screen_width - 10, task_y_pos, infoText, Cols.dark,
+                             shadowSize=2, justify="right")
 
                 if show_progress_bar:
                     bar_start_x = screen_width * 0.7
                     bar_y = task_y_pos + progress_bar_y_offset
                     outline_rect = pygame.Rect(bar_start_x, bar_y, progress_bar_width, progress_bar_height)
-                    pygame.draw.rect(screenUI, Cols.dark, outline_rect, 2, border_radius=progress_bar_corner_radius)
+                    pygame.draw.rect(surf_ui, Cols.dark, outline_rect, 2, border_radius=progress_bar_corner_radius)
 
                     fill_width = progress_bar_width * progress_ratio
                     if fill_width >= 1:
@@ -767,7 +970,7 @@ if __name__ == "__main__":
                             current_corner_radius = 0
 
                         fill_rect = pygame.Rect(bar_start_x, bar_y, fill_width, progress_bar_height)
-                        pygame.draw.rect(screenUI, Cols.crimson, fill_rect, 0, border_radius=current_corner_radius)
+                        pygame.draw.rect(surf_ui, Cols.crimson, fill_rect, 0, border_radius=current_corner_radius)
 
                 y_pos_offset += line_height
 
@@ -776,9 +979,11 @@ if __name__ == "__main__":
             for task_name_key in LOADING_STEPS_FOR_PROGRESS_BAR:  # Use the curated list for the main progress bar
                 task_data = task_display_states[task_name_key]
                 if task_data['status'] == 'Finished':
-                    total_current_progress_elapsed += task_data['expected_time']  # Always use expected_time for finished tasks for smooth linear progress
+                    total_current_progress_elapsed += task_data[
+                        'expected_time']  # Always use expected_time for finished tasks for smooth linear progress
                 elif task_data['status'] == 'Starting' or task_data['status'] == 'Sent':
-                    total_current_progress_elapsed += min(time.time() - task_data['start_time'], task_data['expected_time'])  # Cap elapsed time at expected
+                    total_current_progress_elapsed += min(time.time() - task_data['start_time'],
+                                                          task_data['expected_time'])  # Cap elapsed time at expected
 
             total_progress_ratio = normalize(total_current_progress_elapsed, 0, total_expected_loading_time, clamp=True)
 
@@ -788,7 +993,8 @@ if __name__ == "__main__":
             total_bar_width = screen_width - 2 * total_bar_x_margin
 
             # Draw overall progress bar outline
-            pygame.draw.rect(screenUI, Cols.dark, (total_bar_x_margin, total_bar_y, total_bar_width, total_bar_height), 2, border_radius=total_bar_height // 3)
+            pygame.draw.rect(surf_ui, Cols.dark, (total_bar_x_margin, total_bar_y, total_bar_width, total_bar_height),
+                             2, border_radius=total_bar_height // 3)
 
             # Draw overall progress bar fill
             fill_total_width = total_bar_width * total_progress_ratio
@@ -800,21 +1006,30 @@ if __name__ == "__main__":
                 if current_corner_radius < 0:
                     current_corner_radius = 0
                 fill_rect = pygame.Rect(total_bar_x_margin, total_bar_y, fill_total_width, total_bar_height)
-                pygame.draw.rect(screenUI, Cols.crimson, fill_rect, 0, border_radius=current_corner_radius)
+                pygame.draw.rect(surf_ui, Cols.crimson, fill_rect, 0, border_radius=current_corner_radius)
 
             # Draw overall progress text
             progress_percentage = int(total_progress_ratio * 100)
             if Alkhemikal30:
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_width / 2, total_bar_y - 25, f"Total Progress: {progress_percentage}%", Cols.dark, 3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_width / 2, total_bar_y - 25,
+                         f"Total Progress: {progress_percentage}%", Cols.dark, 3, justify="middle",
+                         centeredVertically=True)
 
             if toggle:
                 string_fps = f"FPS: {round(clock.get_fps())}"
-                drawText(screenUI, Cols.crimson, Alkhemikal30, 5, screen_height - 30, string_fps, Cols.dark, 3, antiAliasing=False)
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark, 3, justify="middle", centeredVertically=True)
-                pygame.draw.circle(screenUI, Cols.dark, (mx + 2, my + 2), 7, 2)
-                pygame.draw.circle(screenUI, Cols.light, (mx, my), 7, 2)
+                drawText(surf_ui, Cols.crimson, Alkhemikal30, 5, screen_height - 30, string_fps, Cols.dark, 3,
+                         antiAliasing=False)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark,
+                         3, justify="middle", centeredVertically=True)
+                pygame.draw.circle(surf_ui, Cols.dark, (mx + 2, my + 2), 7, 2)
+                pygame.draw.circle(surf_ui, Cols.light, (mx, my), 7, 2)
 
-            screen.blit(screenUI, (0, 0))
+            # FLUSH LOADING RENDER
+            ctx.screen.use()
+            ctx.clear(0, 0, 0, 1)
+            tex_ui.write(pygame.image.tobytes(surf_ui, 'RGBA'))
+            tex_ui.use(location=0)
+            vao_ui.render(moderngl.TRIANGLE_STRIP)
             pygame.display.flip()
             clock.tick(fps)
             continue
@@ -831,19 +1046,24 @@ if __name__ == "__main__":
         if all_current_run_times:
             save_execution_times(all_current_run_times)
 
-        if TH is None:
+        # FIXED: Ensure TH is valid before breaking loop
+        if TH is None or TH.playersSurfScreen is None:
             print("Error: TileHandler failed to initialize. Exiting.")
             pygame.quit()
             sys.exit()
-        if TH.playersSurfScreen is None:
-            print("CRITICAL MAIN ERROR: TH.playersSurfScreen is None post-init. Exiting.")
-            pygame.quit()
-            sys.exit()
+
         print("Main: TileHandler fully initialized. Starting game.")
 
-        player = Player(target_host_ip, target_host_port, None, (screen_width, screen_height), {'30': Alkhemikal30, '50': Alkhemikal50, '80': Alkhemikal80, '150': Alkhemikal150, '200': Alkhemikal200}, Cols)
+        player = Player(target_host_ip, target_host_port, None, (screen_width, screen_height),
+                        {'30': Alkhemikal30, '50': Alkhemikal50, '80': Alkhemikal80, '150': Alkhemikal150,
+                         '200': Alkhemikal200}, Cols)
 
         break
+
+    # --- GAME LOOP ---
+    if not running:  # Safety check if quit during loading
+        pygame.quit()
+        sys.exit()
 
     scrollSpeed = 50
     scroll = [0.0, 0.0]
@@ -853,10 +1073,12 @@ if __name__ == "__main__":
 
     bottomUIBarSize = uiInfo.bottomUIBarSize * screen_height
 
+    # FIX: Lock scroll to 0 if map fits in screen (Align Top-Left)
     max_scroll_x = 0
-    min_scroll_x = -(TH.mapWidth - screen_width)
+    min_scroll_x = min(0, -(TH.mapWidth - screen_width))
+
     max_scroll_y = 0
-    min_scroll_y = -(TH.mapHeight - screen_height)
+    min_scroll_y = min(0, -(TH.mapHeight - screen_height))
 
     debug = False
     mouseSize = 1
@@ -864,14 +1086,27 @@ if __name__ == "__main__":
     showClouds = True
     pygame.mouse.set_visible(False)
 
-    game_screen_surface = pygame.Surface((screen_width, screen_height)).convert_alpha()
+    # Time variable for shader animation
+    t = 0.0
 
     while running:
-        mx, my = pygame.mouse.get_pos()
-        game_screen_surface.fill(Cols.dark)
-        screenUI.fill((0, 0, 0, 0))
-        dt = (time.time() - last_time) * fps
+        dt_raw = clock.tick(fps) / 1000.0
+        t += dt_raw
+        dt = dt_raw * fps
         last_time = time.time()
+
+        mx, my = pygame.mouse.get_pos()
+
+        # Calculate Mouse Position for Shader (Render Space)
+        # Mouse is in Window Space (e.g. 1920x1080), Clouds in Render Space (400x225)
+        mx_render = mx * (INT_CLOUD_RENDER_W / WINDOW_WIDTH)
+        # Y-Flip logic: (WINDOW_HEIGHT - my)
+        # Then scale to cloud render height
+        my_render = (WINDOW_HEIGHT - my) * (INT_CLOUD_RENDER_H / WINDOW_HEIGHT)
+
+        # Clear Surfaces
+        surf_game.fill(Cols.dark)
+        surf_ui.fill((0, 0, 0, 0))
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -912,18 +1147,20 @@ if __name__ == "__main__":
 
         targetScroll[0] += scrollSpeed * moving[0]
         targetScroll[1] += scrollSpeed * moving[1]
-        targetScroll[0] = min(max(targetScroll[0], min_scroll_x), max_scroll_x)
-        targetScroll[1] = min(max(targetScroll[1], min_scroll_y), max_scroll_y)
+        scrollBufferSize = 100
+        targetScroll[0] = min(max(targetScroll[0], min_scroll_x - scrollBufferSize), max_scroll_x + scrollBufferSize)
+        targetScroll[1] = min(max(targetScroll[1], min_scroll_y - scrollBufferSize), max_scroll_y + scrollBufferSize)
 
         diffs = [targetScroll[0] - scroll[0], targetScroll[1] - scroll[1]]
         for idx, diff in enumerate(diffs):
             momentum[idx] += diff / 25
             momentum[idx] *= 0.7
             scroll[idx] += momentum[idx]
-            scroll[idx] = min(max(scroll[idx], [min_scroll_x, min_scroll_y][idx]), [max_scroll_x, max_scroll_y][idx])
-        adjustedMx, adjustedMy = [mx - scroll[0], my - scroll[1]]
+            scroll[idx] = min(max(scroll[idx], [min_scroll_x - scrollBufferSize, min_scroll_y - scrollBufferSize][idx]), [max_scroll_x + scrollBufferSize, max_scroll_y + scrollBufferSize][idx])
 
+        adjustedMx, adjustedMy = [mx - scroll[0], my - scroll[1]]
         tile_under_mouse = TH.getTileAtPosition(adjustedMx, adjustedMy)
+
         hovered_territory = None
         if tile_under_mouse and tile_under_mouse.territory_id != -1:
             potential_hovered_terr = TH.territories_by_id.get(tile_under_mouse.territory_id)
@@ -936,42 +1173,149 @@ if __name__ == "__main__":
         player.handleClick(click, dt, hovered_territory)
         player.update(dt)
 
-        visible_map_rect_on_full_map = pygame.Rect(-scroll[0], -scroll[1], screen_width, screen_height)
+        # --- PYGAME DRAWING (CPU) ---
+
+        # 1. Draw Game World to High Res Surface (Window Res)
+        high_res_view = pygame.Surface((screen_width, screen_height))
+        high_res_view.fill(Cols.dark)
 
         if TH.baseMapSurf:
-            game_screen_surface.blit(TH.baseMapSurf.subsurface(visible_map_rect_on_full_map), (0, 0))
+            # CHANGED: Replaced subsurface with direct blit + offset to prevent crashing
+            # This relies on Pygame's built-in clipping which handles out-of-bounds better than subsurface()
+            high_res_view.blit(TH.baseMapSurf, (scroll[0], scroll[1]))
 
         if debug and TH.debugOverlayFullMap:
-            game_screen_surface.blit(TH.debugOverlayFullMap.subsurface(visible_map_rect_on_full_map), (0, 0))
+            high_res_view.blit(TH.debugOverlayFullMap, (scroll[0], scroll[1]))
 
-        TH.drawTerritoryHighlights(game_screen_surface, hovered_territory, player.selectedTerritory, scroll)
+        TH.drawTerritoryHighlights(high_res_view, hovered_territory, player.selectedTerritory, scroll)
 
         TH.playersSurfScreen.fill((0, 0, 0, 0))
-        if TH.playersSurfScreen:
-            player.draw(TH.playersSurfScreen, screenUI, False, scroll)
-            game_screen_surface.blit(TH.playersSurfScreen, (0, 0))
-        if showClouds and TH.cloudSurfFullMap:
-            TH.drawClouds(game_screen_surface, adjustedMx, adjustedMy, mouseSize, player, scroll, [screen_width, screen_height], player.visibleTerritoryIDs)
+        player.draw(TH.playersSurfScreen, surf_ui, False, scroll)  # Note: Passing surf_ui for any text overlays
+        high_res_view.blit(TH.playersSurfScreen, (0, 0))
 
-        pygame.draw.line(screenUI, Cols.debugRed, (0, screen_height - bottomUIBarSize), (screen_width, screen_height - bottomUIBarSize), 2)
+        # 2. Downscale Game World to "Pixel Art" Texture (Render Res)
+        pygame.transform.scale(high_res_view, (INT_GAME_RENDER_W, INT_GAME_RENDER_H), surf_game)
 
+        # 3. Draw UI (High Res)
+        pygame.draw.line(surf_ui, Cols.debugRed, (0, screen_height - bottomUIBarSize),
+                         (screen_width, screen_height - bottomUIBarSize), 2)
         if toggle:
             fps_text = f"{clock.get_fps():.1f}"
             if Alkhemikal30:
                 sel_terr_text = "No Territory"
                 if player.selectedTerritory and hasattr(player.selectedTerritory, 'id'):
                     sel_terr_text = f"Territory ID: {player.selectedTerritory.id}"
-                drawText(screenUI, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark, 3, justify="middle", centeredVertically=True)
-                drawText(screenUI, Cols.debugRed, Alkhemikal30, 5, screen_height - 90, sel_terr_text, Cols.dark, 3, antiAliasing=False)
-                drawText(screenUI, Cols.debugRed, Alkhemikal30, 5, screen_height - 60, fps_text, Cols.dark, 3, antiAliasing=False)
-                drawText(screenUI, Cols.debugRed, Alkhemikal30, 5, screen_height - 30, "[spc] UI, [x] Debug, [m] Mouse Size, [c] Clouds", Cols.dark, 3, antiAliasing=False)
-            pygame.draw.circle(screenUI, Cols.dark, (mx + 2, my + 2), 7, 2)
-            pygame.draw.circle(screenUI, Cols.light, (mx, my), 7, 2)
+                drawText(surf_ui, Cols.light, Alkhemikal30, screen_width / 2, 30, f"your name is {username}", Cols.dark,
+                         3, justify="middle", centeredVertically=True)
+                drawText(surf_ui, Cols.debugRed, Alkhemikal30, 5, screen_height - 90, sel_terr_text, Cols.dark, 3,
+                         antiAliasing=False)
+                drawText(surf_ui, Cols.debugRed, Alkhemikal30, 5, screen_height - 60, fps_text, Cols.dark, 3,
+                         antiAliasing=False)
+                drawText(surf_ui, Cols.debugRed, Alkhemikal30, 5, screen_height - 30,
+                         "[spc] UI, [x] Debug, [m] Mouse Size, [c] Clouds", Cols.dark, 3, antiAliasing=False)
+            pygame.draw.circle(surf_ui, Cols.dark, (mx + 2, my + 2), 7, 2)
+            pygame.draw.circle(surf_ui, Cols.light, (mx, my), 7, 2)
 
-        screen.blit(game_screen_surface, (0, 0))
-        screen.blit(screenUI, (0, 0))
+        # --- MODERNGL PIPELINE (GPU) ---
+
+        cam_x = -scroll[0]
+        cam_y = -scroll[1]
+
+        scroll_render_x = cam_x * (INT_CLOUD_RENDER_W / WINDOW_WIDTH)
+        scroll_render_y = cam_y * (INT_CLOUD_RENDER_H / WINDOW_HEIGHT)
+
+        clouds.update(scroll_render_x, scroll_render_y, dt_raw)
+
+        # B. Upload Textures & Buffers
+        tex_game.write(pygame.image.tobytes(surf_game, 'RGB'))
+        tex_ui.write(pygame.image.tobytes(surf_ui, 'RGBA'))
+        vbo_instances.write(clouds.get_instance_buffer())
+
+        # C. Prepare Vision Holes (Fog of War)
+        holes = []
+
+        # 1. Mouse Hole
+        # Already calculated mx_render, my_render above using Y-Flip.
+        holes.append((mx_render, my_render))
+
+        # 2. Ship Holes
+        for s in player.ships:
+            # Ship World Pos (s.pos) -> Screen Pos -> Render Space -> Y-Flip
+            # Screen X = s.pos[0] + scroll[0] (because scroll is negative offset)
+            screen_x = s.pos[0] + scroll[0]
+            screen_y = s.pos[1] + scroll[1]
+
+            sx = screen_x * (INT_CLOUD_RENDER_W / WINDOW_WIDTH)
+            # Flip Y for GL
+            sy = (WINDOW_HEIGHT - screen_y) * (INT_CLOUD_RENDER_H / WINDOW_HEIGHT)
+
+            holes.append((sx, sy))
+
+        # 3. Territory Holes
+        visible_tiles_count = 0
+        MAX_SHADER_HOLES = 256
+        view_rect = pygame.Rect(-scroll[0], -scroll[1], screen_width, screen_height)
+
+        for tid in player.visibleTerritoryIDs:
+            terr = TH.territories_by_id.get(tid)
+            if terr:
+                for tile in terr.tiles:
+                    # Check visibility in World Space
+                    if view_rect.collidepoint(tile.x, tile.y):
+                        screen_x = tile.x + scroll[0]
+                        screen_y = tile.y + scroll[1]
+
+                        tx = screen_x * (INT_CLOUD_RENDER_W / WINDOW_WIDTH)
+                        ty = (WINDOW_HEIGHT - screen_y) * (INT_CLOUD_RENDER_H / WINDOW_HEIGHT)
+
+                        holes.append((tx, ty))
+                        visible_tiles_count += 1
+                        if len(holes) >= MAX_SHADER_HOLES: break
+            if len(holes) >= MAX_SHADER_HOLES: break
+
+        # Pad with dummies
+        while len(holes) < MAX_SHADER_HOLES:
+            holes.append((-9999.0, -9999.0))
+
+        # Update Shader Uniforms
+        prog_clouds['u_holes'].value = holes
+        prog_clouds['u_num_holes'].value = visible_tiles_count + 1 + len(player.ships)
+        # FIX: Pass Vision Radius
+        prog_clouds['u_vision_radius'].value = VISION_RADIUS
+
+        # D. Render Clouds (Low Res FBO)
+        fbo_clouds.use()
+        ctx.clear(0, 0, 0, 0)
+        # Note: We pass `scroll_render_x` which is positive camera pos.
+        # Shader does `center - u_scroll`.
+        # FIX: Negate Y to align movement with Map
+        prog_clouds['u_scroll'].value = (scroll_render_x, -scroll_render_y)
+        prog_clouds['u_time'].value = t
+        if showClouds:
+            for i in range(5):
+                prog_clouds['u_layer_idx'].value = i
+                vao_clouds.render(moderngl.TRIANGLE_STRIP, instances=CLOUD_COUNT)
+
+        # E. Composite (High Res Land + Low Res Clouds + Godrays) -> FBO
+        fbo_composite.use()
+        ctx.clear(0, 0, 0, 0)
+        tex_game.use(location=0)
+        tex_cloud_color.use(location=1)
+        # prog_comp['u_time'].value = t
+        vao_comp.render(moderngl.TRIANGLE_STRIP)
+
+        # F. Post Processing (Bloom/Vignette) -> Screen
+        ctx.screen.use()
+        ctx.clear(0, 0, 0, 1)
+        tex_composite.use(location=0)
+        prog_post['u_time'].value = t
+        vao_post.render(moderngl.TRIANGLE_STRIP)
+
+        # G. UI Overlay -> Screen
+        tex_ui.use(location=0)
+        vao_ui.render(moderngl.TRIANGLE_STRIP)
+
         pygame.display.flip()
-        clock.tick(fps)
 
     pygame.quit()
     sys.exit()

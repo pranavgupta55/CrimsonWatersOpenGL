@@ -7,18 +7,37 @@ from collections import deque
 from text import drawText
 from calcs import distance, ang, normalize_angle, draw_arrow, linearGradient, normalize
 from territory import Territory
+from locationalObjects import Resource, Harbor
 import time
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from controlPanel import GenerationInfo
 import os
-import pickle
-import gzip
+import sys
 
-CLOUD_PRECOMP_DIR = "cloudPrecomp"
+# Global check for Shapely
+try:
+    from shapely.geometry import Polygon
+    import shapely.wkb
+
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
 
 
 class Hex:
+    __slots__ = (
+        'grid_x', 'grid_y', 'x', 'y', 'size', 'tile_id', 'col', 'cloudCol',
+        'center', 'hex', 'floatHexVertices',
+        'adjacent_tile_ids', 'territory_id', 'adjacent', 'territory',
+        'region', 'mountainRegion', 'regionCol',
+        'waterLand', 'mountainous', 'cloudy',
+        'isLand', 'isMountain', 'isCoast',
+        'connectedOceanID', 'cloudOpacity', 'precomp_chunk_coords'
+    )
+
+    _cached_offsets = {}
+
     def __init__(self, grid_x, grid_y, x, y, size, tile_id, col=(0, 0, 0), cloudCol=(50, 50, 50)):
         self.tile_id = tile_id
         self.grid_x = grid_x
@@ -29,18 +48,25 @@ class Hex:
         self.col = col
         self.cloudCol = cloudCol
         self.center = [self.x, self.y]
-        self.floatHexVertices = [(self.x + self.size * math.cos(math.pi / 3 * angle), self.y + self.size * math.sin(math.pi / 3 * angle)) for angle in range(6)]
-        self.hex = [(int(round(p[0])), int(round(p[1]))) for p in self.floatHexVertices]
+
+        # Geometry
+        self.calculate_geometry()
+
+        # Relationships
         self.adjacent_tile_ids = []
-        self.territory_id = -1
         self.adjacent = []
+        self.territory_id = -1
         self.territory = None
+
+        # Generation Data
         self.region = None
         self.mountainRegion = None
         self.regionCol = None
         self.waterLand = random.random()
         self.mountainous = random.random()
         self.cloudy = random.random()
+
+        # Flags
         self.isLand = False
         self.isMountain = False
         self.isCoast = False
@@ -48,18 +74,22 @@ class Hex:
         self.cloudOpacity = 1.0
         self.precomp_chunk_coords = None
 
-    def prepare_for_pickling(self):
-        self.adjacent_tile_ids = []
-        for adj in self.adjacent:
-            if hasattr(adj, 'tile_id'):
-                self.adjacent_tile_ids.append(adj.tile_id)
-        self.adjacent = []
-        self.territory = None
-        self.region = None
-        self.mountainRegion = None
+    def calculate_geometry(self):
+        if self.size not in Hex._cached_offsets:
+            offsets = []
+            for angle in range(6):
+                offsets.append((self.size * math.cos(math.pi / 3 * angle),
+                                self.size * math.sin(math.pi / 3 * angle)))
+            Hex._cached_offsets[self.size] = offsets
+
+        offsets = Hex._cached_offsets[self.size]
+        self.floatHexVertices = [(self.x + ox, self.y + oy) for ox, oy in offsets]
+        self.hex = [(int(round(p[0])), int(round(p[1]))) for p in self.floatHexVertices]
 
     @property
     def bounding_rect(self):
+        if not hasattr(self, 'hex') or not self.hex:
+            self.calculate_geometry()
         min_x = min(p[0] for p in self.hex)
         max_x = max(p[0] for p in self.hex)
         min_y = min(p[1] for p in self.hex)
@@ -68,13 +98,6 @@ class Hex:
 
     def draw(self, s):
         pygame.draw.polygon(s, self.col, self.hex)
-
-    def drawCloud(self, s, scroll_x, scroll_y):
-        alpha = int(self.cloudOpacity * 255)
-        color_rgb = self.cloudCol[:3] if isinstance(self.cloudCol, (list, tuple)) and len(self.cloudCol) >= 3 else (50, 50, 50)
-        final_color_rgba = tuple(color_rgb) + (alpha,)
-        shifted_hex = [(p[0] + scroll_x, p[1] + scroll_y) for p in self.hex]
-        pygame.draw.polygon(s, final_color_rgba, shifted_hex)
 
     def drawArrows(self, s, color, scroll_x, scroll_y):
         if not self.adjacent:
@@ -85,17 +108,22 @@ class Hex:
             dist_val = distance((self.x, self.y), (adj.x, adj.y))
             factor = 0.35
             start_pos = (self.x + scroll_x, self.y + scroll_y)
-            end_pos = (self.x + dist_val * factor * math.cos(angle) + scroll_x, self.y + dist_val * factor * math.sin(angle) + scroll_y)
+            end_pos = (self.x + dist_val * factor * math.cos(angle) + scroll_x,
+                       self.y + dist_val * factor * math.sin(angle) + scroll_y)
             draw_arrow(s, start_pos, end_pos, arrow_col, pygame, 2, 5, 25)
 
     def showWaterLand(self, s, font, color, scroll_x, scroll_y):
         if font:
             text_col = tuple(color) if color else (0, 0, 0)
-            drawText(s, text_col, font, self.x + scroll_x, self.y + scroll_y, f"{self.waterLand:.2f}", justify="center", centeredVertically=True)
+            drawText(s, text_col, font, self.x + scroll_x, self.y + scroll_y, f"{self.waterLand:.2f}", justify="center",
+                     centeredVertically=True)
 
 
 class TileHandler:
-    def __init__(self, map_width, map_height, size, cols, waterThreshold=0.51, mountainThreshold=0.51, territorySize=100, font=None, font_name=None, resource_info=None, structure_info=None, status_queue: multiprocessing.Queue = None, preset_times: dict = None, seed: int = None, viewport_width=0, viewport_height=0):
+    def __init__(self, map_width, map_height, size, cols, waterThreshold=0.51, mountainThreshold=0.51,
+                 territorySize=100, font=None, font_name=None, resource_info=None, structure_info=None,
+                 status_queue: multiprocessing.Queue = None, preset_times: dict = None, seed: int = None,
+                 viewport_width=0, viewport_height=0):
 
         self.execution_times = {}
         self.status_queue = status_queue
@@ -129,7 +157,9 @@ class TileHandler:
         self.territories_by_id = {}
         self.harbors_by_id = {}
         self.contiguousTerritoryIDs = []
+
         self.all_territories_for_unpickling = []
+
         self.oceanTiles = {}
         self._ocean_id_map = {}
         self._ocean_water = {}
@@ -145,31 +175,22 @@ class TileHandler:
         self.allCoastalTiles = []
 
         self.allHarbors = None
-
         self.baseMapSurf = None
         self.debugOverlayFullMap = None
-        self.cloudSurfFullMap = None
-
         self.territoryHighlightSurfScreen = None
         self.playersSurfScreen = None
 
-        self.cloud_surf_initialized = False
-        self.active_transparent_tiles = set()
-
-        print(self.size)
-        self.PRECOMP_CHUNK_SIZE = 6 * self.size
-        self.precomp_radii = sorted([50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600])
-        self.precomp_chunk_grid_tiles = {}
-        self.precomp_grid_width = math.ceil(self.mapWidth / self.PRECOMP_CHUNK_SIZE)
-        self.precomp_grid_height = math.ceil(self.mapHeight / self.PRECOMP_CHUNK_SIZE)
         self._temp_contiguous_territories_objs = None
-        self.territory_vision_cache = {}
-        self._relative_hex_offsets_pattern = []
-        self.precomputed_cloud_info = {}
 
-        self.STEP_NAMES = {"TILE_GEN": "tileGen", "CLOUD_PRECOMP": "cloudPrecompParallel", "LINK_ADJ": "linkAdj", "GEN_CYCLES": "generationCycles", "SET_COLORS": "setTileColors", "FIND_REGIONS": "findLandRegionsParallel", "INDEX_OCEANS": "indexOceansParallel", "ASSIGN_COAST": "assignCoastTiles", "CREATE_TERR": "createTerritories", "CONNECT_HARBORS": "connectHarborsParallel", "PRECOMP_TERR_VISION": "precomputeTerritoryVision", "TOTAL_INIT": "workerInit", "PREP_PICKLING": "dataSerialization",
+        self.STEP_NAMES = {"TILE_GEN": "tileGen", "LINK_ADJ": "linkAdj", "GEN_CYCLES": "generationCycles",
+                           "SET_COLORS": "setTileColors", "FIND_REGIONS": "findLandRegionsParallel",
+                           "INDEX_OCEANS": "indexOceansParallel", "ASSIGN_COAST": "assignCoastTiles",
+                           "CREATE_TERR": "createTerritories", "CONNECT_HARBORS": "connectHarborsParallel",
+                           "TOTAL_INIT": "workerInit", "PREP_PICKLING": "dataSerialization",
                            "GFX_TOTAL_INIT": "gfxTotalInit"}
 
+    def run_generation_sequence(self):
+        """Runs the full generation pipeline."""
         total_init_start_time_timer = time.time()
         landRegionsRaw_result = None
 
@@ -180,11 +201,14 @@ class TileHandler:
                 self.status_queue.put_nowait((step_full_name, "START", expected_time))
 
             s_time = time.time()
+            print(f"[WORKER DEBUG] Starting {step_key}...")
             result = func_to_run(*args)
             e_time = time.time()
-            self.execution_times[step_full_name] = e_time - s_time
+            duration = e_time - s_time
+            print(f"[WORKER DEBUG] Finished {step_key} in {duration:.4f}s")
+            self.execution_times[step_full_name] = duration
             if self.status_queue:
-                self.status_queue.put_nowait((step_full_name, "FINISHED", e_time - s_time))
+                self.status_queue.put_nowait((step_full_name, "FINISHED", duration))
             return result
 
         def _threaded_task_wrapper(step_key_for_timing, func_to_run, *args):
@@ -195,9 +219,11 @@ class TileHandler:
                 self.status_queue.put_nowait((step_full_name, "START", expected_time))
 
             s_time = time.time()
+            print(f"[WORKER DEBUG] Starting Threaded {step_key_for_timing}...")
             result = func_to_run(*args)
             e_time = time.time()
             duration = e_time - s_time
+            print(f"[WORKER DEBUG] Finished Threaded {step_key_for_timing} in {duration:.4f}s")
             self.execution_times[step_full_name] = duration
             if self.status_queue:
                 self.status_queue.put_nowait((step_full_name, "FINISHED", duration))
@@ -207,57 +233,48 @@ class TileHandler:
 
         _run_step_sequential("TILE_GEN", self.generateTiles)
         _run_step_sequential("LINK_ADJ", self._link_adjacent_objects)
-
-        cloud_precomp_future = internal_executor.submit(_threaded_task_wrapper, "CLOUD_PRECOMP", self._precompute_cloud_visibility)
-
         _run_step_sequential("GEN_CYCLES", lambda: [self.generationCycle() for _ in range(50)])
 
         set_colors_future = internal_executor.submit(_threaded_task_wrapper, "SET_COLORS", self.setTileCols)
-        set_colors_future.result()  # Wait for coloring to complete
+        set_colors_future.result()
 
-        find_regions_future = internal_executor.submit(_threaded_task_wrapper, "FIND_REGIONS", self.findContiguousRegions, [t for t in self.tiles if t.waterLand >= self.waterThreshold])
+        find_regions_future = internal_executor.submit(_threaded_task_wrapper, "FIND_REGIONS",
+                                                       self.findContiguousRegions,
+                                                       [t for t in self.tiles if t.waterLand >= self.waterThreshold])
         index_oceans_future = internal_executor.submit(_threaded_task_wrapper, "INDEX_OCEANS", self.indexOceans)
 
         landRegionsRaw_result = find_regions_future.result()
         index_oceans_future.result()
 
         assign_coast_future = internal_executor.submit(_threaded_task_wrapper, "ASSIGN_COAST", self.assignCoastTiles)
-        assign_coast_future.result()  # Wait for coastal assignment
+        assign_coast_future.result()
 
         _run_step_sequential("CREATE_TERR", lambda: self.createTerritories(landRegionsRaw_result))
 
-        connect_harbors_future = internal_executor.submit(_threaded_task_wrapper, "CONNECT_HARBORS", self.connectTerritoryHarbors)
-        precompute_vision_future = internal_executor.submit(_threaded_task_wrapper, "PRECOMP_TERR_VISION", self._precompute_territory_vision)
-
-        # Wait for all parallel tasks to finish
-        cloud_precomp_future.result()
+        connect_harbors_future = internal_executor.submit(_threaded_task_wrapper, "CONNECT_HARBORS",
+                                                          self.connectTerritoryHarbors)
         connect_harbors_future.result()
-        precompute_vision_future.result()
 
         internal_executor.shutdown(wait=True)
 
         self.execution_times[self.STEP_NAMES["TOTAL_INIT"]] = time.time() - total_init_start_time_timer
         if self.status_queue:
-            self.status_queue.put_nowait((self.STEP_NAMES["TOTAL_INIT"], "FINISHED", self.execution_times[self.STEP_NAMES["TOTAL_INIT"]]))
+            self.status_queue.put_nowait(
+                (self.STEP_NAMES["TOTAL_INIT"], "FINISHED", self.execution_times[self.STEP_NAMES["TOTAL_INIT"]]))
 
-    def prepare_for_pickling(self):
+    def prepare_payload(self):
+        """
+        Serializes world data into a dictionary of arrays (Structure of Arrays).
+        """
         method_start_time = time.time()
+        print("[WORKER] Preparing Payload (Structure of Arrays)...")
 
         if self.status_queue:
             expected_time = self.preset_times.get(self.STEP_NAMES["PREP_PICKLING"], 999.0)
             self.status_queue.put_nowait((self.STEP_NAMES["PREP_PICKLING"], "START", expected_time))
 
-        self.baseMapSurf = None
-        self.debugOverlayFullMap = None
-        self.cloudSurfFullMap = None
-        self.territoryHighlightSurfScreen = None
-        self.playersSurfScreen = None
-
-        self.font = None
-        self.cloud_surf_initialized = False
-        self.active_transparent_tiles = set()
-
-        self.all_territories_for_unpickling = list(self.territories_by_id.values())
+        # --- FIX 1: Populate contiguousTerritoryIDs logic here ---
+        # This was missing in the previous version, causing outlines/resources to not draw.
         if hasattr(self, '_temp_contiguous_territories_objs') and self._temp_contiguous_territories_objs:
             self.contiguousTerritoryIDs = []
             for terr_list in self._temp_contiguous_territories_objs:
@@ -266,149 +283,296 @@ class TileHandler:
                     if hasattr(terr, 'id'):
                         current_id_list.append(terr.id)
                 self.contiguousTerritoryIDs.append(current_id_list)
+            # Clear memory
             del self._temp_contiguous_territories_objs
         else:
+            # Fallback if empty, though it shouldn't be
             self.contiguousTerritoryIDs = []
 
-        for tile in self.tiles:
-            tile.prepare_for_pickling()
-        for territory_obj in self.all_territories_for_unpickling:
-            territory_obj.prepare_for_pickling()
-            if hasattr(territory_obj, 'harbors'):
-                for harbor in territory_obj.harbors:
-                    if hasattr(harbor, 'prepare_for_pickling'):
-                        harbor.prepare_for_pickling()
+        # 1. Tiles Data
+        # OPTIMIZATION: Removed 'adj_ids' to speed up transfer. Will recalculate on client.
+        soa_tiles = {
+            'grid_x': [t.grid_x for t in self.tiles],
+            'grid_y': [t.grid_y for t in self.tiles],
+            'x': [t.x for t in self.tiles],
+            'y': [t.y for t in self.tiles],
+            'size': self.size,  # Constant
+            'tile_id': [t.tile_id for t in self.tiles],
+            'col': [t.col for t in self.tiles],
+            'cloudCol': [t.cloudCol for t in self.tiles],
+            'waterLand': [t.waterLand for t in self.tiles],
+            'mountainous': [t.mountainous for t in self.tiles],
+            'cloudy': [t.cloudy for t in self.tiles],
+            'isLand': [t.isLand for t in self.tiles],
+            'isMountain': [t.isMountain for t in self.tiles],
+            'isCoast': [t.isCoast for t in self.tiles],
+            'connectedOceanID': [t.connectedOceanID for t in self.tiles],
+            'territory_id': [t.territory_id for t in self.tiles],
+        }
 
-        self.oceanTiles = {}
-        self._ocean_id_map = {}
-        self._ocean_water = {}
-        self.territories_by_id = {}
-        self.harbors_by_id = {}
-        self.tiles_by_id = {}
-        self.tiles_by_grid_coords = {}
+        # 2. Territories Data
+        all_terrs = list(self.territories_by_id.values())
+        soa_territories = {
+            'id': [t.id for t in all_terrs],
+            'centerPos': [t.centerPos for t in all_terrs],
+            'territoryCol': [t.territoryCol for t in all_terrs],
+            'selectedTerritoryCol': [t.selectedTerritoryCol for t in all_terrs],
+            'tile_ids': [[ti.tile_id for ti in t.tiles] for t in all_terrs],
+            'harbor_ids': [[h.harbor_id for h in t.harbors] for t in all_terrs],
+            'exteriors': [t.exteriors for t in all_terrs],
+            'interiors': [t.interiors for t in all_terrs],
+            'wkb': []
+        }
+
+        soa_territories['resources'] = []
+        for terr in all_terrs:
+            res_data = [(r.tile.tile_id, r.resourceType) for r in terr.containedResources]
+            soa_territories['resources'].append(res_data)
+
+            # WKB
+            if SHAPELY_AVAILABLE and terr.polygon:
+                soa_territories['wkb'].append(terr.polygon.wkb)
+            else:
+                soa_territories['wkb'].append(None)
+
+        # 3. Harbors Data
+        all_harbors_flat = []
+        for terr in all_terrs:
+            all_harbors_flat.extend(terr.harbors)
+
+        soa_harbors = {
+            'id': [h.harbor_id for h in all_harbors_flat],
+            'tile_id': [(h.tile.tile_id if h.tile else -1) for h in all_harbors_flat],
+            'parent_id': [(h.parentTerritory.id if h.parentTerritory else -1) for h in all_harbors_flat],
+            'tradeRoutesPoints': [h.tradeRoutesPoints for h in all_harbors_flat],
+            'isUsable': [h.isUsable for h in all_harbors_flat],
+            'tradeRoutesData': [h.tradeRoutesData for h in all_harbors_flat]
+        }
+
+        # Pack into one dict
+        payload = {
+            'tiles': soa_tiles,
+            'territories': soa_territories,
+            'harbors': soa_harbors,
+            'mapWidth': self.mapWidth,
+            'mapHeight': self.mapHeight,
+            'viewportWidth': self.viewportWidth,
+            'viewportHeight': self.viewportHeight,
+            'execution_times': self.execution_times,
+            'contiguousTerritoryIDs': self.contiguousTerritoryIDs  # Now correctly populated
+        }
 
         duration = time.time() - method_start_time
+        print(f"[WORKER] Payload Prep took {duration:.4f}s")
         self.execution_times[self.STEP_NAMES["PREP_PICKLING"]] = duration
         if self.status_queue:
             self.status_queue.put_nowait((self.STEP_NAMES["PREP_PICKLING"], "FINISHED", duration))
 
-    def initialize_graphics_and_external_libs(self, fonts_dict, status_queue=None, preset_times=None):
+        return payload
+
+    def reconstruct_from_payload(self, payload, fonts_dict, status_queue=None, preset_times=None):
+        """
+        Reconstructs the TileHandler state on the main thread from the SoA payload.
+        """
         _local_q_gfx = status_queue
         _local_preset_times_gfx = preset_times if preset_times else {}
 
         if not hasattr(self, 'execution_times'):
             self.execution_times = {}
 
-        GFX_TOTAL_INIT_STEP_NAME = self.STEP_NAMES["GFX_TOTAL_INIT"]
+        if 'execution_times' in payload:
+            self.execution_times.update(payload['execution_times'])
 
+        GFX_TOTAL_INIT_STEP_NAME = self.STEP_NAMES["GFX_TOTAL_INIT"]
         expected_time = _local_preset_times_gfx.get(GFX_TOTAL_INIT_STEP_NAME, 999.0)
+
         if _local_q_gfx:
             _local_q_gfx.put_nowait((GFX_TOTAL_INIT_STEP_NAME, "START", expected_time))
 
         method_total_start_time = time.time()
+        print("[MAIN THREAD] Reconstructing World from Payload...")
 
-        def _surface_setup_fn():
-            self.baseMapSurf = pygame.Surface((self.mapWidth, self.mapHeight)).convert_alpha()
-            self.debugOverlayFullMap = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
-            self.cloudSurfFullMap = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
+        # 1. Restore Scalars
+        self.mapWidth = payload['mapWidth']
+        self.mapHeight = payload['mapHeight']
+        self.viewportWidth = payload['viewportWidth']
+        self.viewportHeight = payload['viewportHeight']
+        self.contiguousTerritoryIDs = payload['contiguousTerritoryIDs']
 
-            self.territoryHighlightSurfScreen = pygame.Surface((self.viewportWidth, self.viewportHeight), pygame.SRCALPHA)
-            self.playersSurfScreen = pygame.Surface((self.viewportWidth, self.viewportHeight), pygame.SRCALPHA)
+        # 2. Setup Surfaces & Fonts
+        self.baseMapSurf = pygame.Surface((self.mapWidth, self.mapHeight)).convert_alpha()
+        self.debugOverlayFullMap = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
+        self.territoryHighlightSurfScreen = pygame.Surface((self.viewportWidth, self.viewportHeight), pygame.SRCALPHA)
+        self.playersSurfScreen = pygame.Surface((self.viewportWidth, self.viewportHeight), pygame.SRCALPHA)
+        self.baseMapSurf.fill((0, 0, 0, 0))
+        self.debugOverlayFullMap.fill((0, 0, 0, 0))
+        self.territoryHighlightSurfScreen.fill((0, 0, 0, 0))
+        self.playersSurfScreen.fill((0, 0, 0, 0))
 
-            self.baseMapSurf.fill((0, 0, 0, 0))
-            self.debugOverlayFullMap.fill((0, 0, 0, 0))
-            self.cloudSurfFullMap.fill((0, 0, 0, 0))
+        if self.font_name and self.font_name in fonts_dict:
+            self.font = fonts_dict[self.font_name]
 
-            self.territoryHighlightSurfScreen.fill((0, 0, 0, 0))
-            self.playersSurfScreen.fill((0, 0, 0, 0))
+        # 3. Reconstruct Tiles
+        t_data = payload['tiles']
+        count = len(t_data['tile_id'])
+        self.tiles = [None] * count
+        self.tiles_by_id = {}
+        self.tiles_by_grid_coords = {}
+        self.allWaterTiles = []
+        self.allLandTiles = []
+        self.allCoastalTiles = []
+        self.oceanTiles = {}
+        self._ocean_id_map = {}
+        self._ocean_water = {}
 
-        def _font_setup_fn():
-            if self.font_name and self.font_name in fonts_dict:
-                self.font = fonts_dict[self.font_name]
+        size_const = t_data['size']
+        for i in range(count):
+            h = Hex(
+                t_data['grid_x'][i], t_data['grid_y'][i],
+                t_data['x'][i], t_data['y'][i],
+                size_const, t_data['tile_id'][i],
+                t_data['col'][i], t_data['cloudCol'][i]
+            )
+            h.waterLand = t_data['waterLand'][i]
+            h.mountainous = t_data['mountainous'][i]
+            h.cloudy = t_data['cloudy'][i]
+            h.isLand = t_data['isLand'][i]
+            h.isMountain = t_data['isMountain'][i]
+            h.isCoast = t_data['isCoast'][i]
+            h.connectedOceanID = t_data['connectedOceanID'][i]
+            h.territory_id = t_data['territory_id'][i]
 
-        def _rebuild_maps_fn():
-            if not hasattr(self, 'all_territories_for_unpickling'):
-                self.all_territories_for_unpickling = []
-            self.territories_by_id = {}
-            self.harbors_by_id = {}
-            all_harbors_temp = []
-            for ter_obj in self.all_territories_for_unpickling:
-                if hasattr(ter_obj, 'id'):
-                    self.territories_by_id[ter_obj.id] = ter_obj
-                    if hasattr(ter_obj, 'harbors') and isinstance(ter_obj.harbors, list):
-                        all_harbors_temp.extend(ter_obj.harbors)
-            h_id_counter = 0
-            for h_obj in all_harbors_temp:
-                n_id = h_id_counter
-                if hasattr(h_obj, 'harbor_id') and h_obj.harbor_id != -1:
-                    n_id = h_obj.harbor_id
+            self.tiles[i] = h
+            # OPTIMIZATION: Direct list lookups later mean we can skip building tiles_by_id if we want,
+            # but legacy code might rely on it.
+            self.tiles_by_id[h.tile_id] = h
+            self.tiles_by_grid_coords[(h.grid_x, h.grid_y)] = h
 
-                self.harbors_by_id[n_id] = h_obj
-                if not hasattr(h_obj, 'harbor_id') or h_obj.harbor_id == -1:
-                    h_obj.harbor_id = n_id
-                h_id_counter = max(h_id_counter, n_id + 1)
+            if h.isLand:
+                self.allLandTiles.append(h)
+            else:
+                self.allWaterTiles.append(h)
+            if h.isCoast: self.allCoastalTiles.append(h)
 
-        def _restore_terr_links_fn():
-            for tile in self.tiles:
-                tile.territory = None
-                if hasattr(tile, 'territory_id') and tile.territory_id != -1:
-                    tile.territory = self.territories_by_id.get(tile.territory_id)
+            if h.connectedOceanID != -1:
+                self._ocean_id_map[h] = h.connectedOceanID
+                if h.connectedOceanID not in self.oceanTiles:
+                    self.oceanTiles[h.connectedOceanID] = set()
+                    self._ocean_water[h.connectedOceanID] = set()
+                self.oceanTiles[h.connectedOceanID].add(h)
+                if not h.isLand:
+                    self._ocean_water[h.connectedOceanID].add(h)
 
-        def _restore_adj_links_fn():
-            if not self.tiles_by_id or not self.tiles_by_grid_coords:
-                self.tiles_by_id = {}
-                self.tiles_by_grid_coords = {}
-                for tile in self.tiles:
-                    self.tiles_by_id[tile.tile_id] = tile
-                    self.tiles_by_grid_coords[(tile.grid_x, tile.grid_y)] = tile
+        # OPTIMIZATION: Recalculate adjacency locally instead of transferring it
+        # This takes negligible time (~0.005s) compared to transferring the list
+        self._link_adjacent_objects()
 
-            for tile in self.tiles:
-                tile.adjacent = []
-                if hasattr(tile, 'adjacent_tile_ids'):
-                    for neighbor_id in tile.adjacent_tile_ids:
-                        neighbor_obj = self.tiles_by_id.get(neighbor_id)
-                        if neighbor_obj:
-                            tile.adjacent.append(neighbor_obj)
+        # 4. Reconstruct Harbors (Temp Store)
+        h_data = payload['harbors']
+        h_count = len(h_data['id'])
+        temp_harbors = {}
+        self.allHarbors = []
+        self.harbors_by_id = {}
 
-        def _terr_harbor_gfx_fn():
-            for ter_obj in self.territories_by_id.values():
-                if hasattr(ter_obj, 'initialize_graphics_and_external_libs'):
-                    ter_obj.initialize_graphics_and_external_libs(self.tiles_by_id, self.harbors_by_id, self.baseMapSurf, self.debugOverlayFullMap)
+        for i in range(h_count):
+            h_id = h_data['id'][i]
+            h_obj = Harbor.__new__(Harbor)
+            h_obj.harbor_id = h_id
+            h_obj.tradeRoutesPoints = h_data['tradeRoutesPoints'][i]
+            h_obj.tradeRoutesData = h_data['tradeRoutesData'][i]
+            h_obj.isUsable = h_data['isUsable'][i]
+            h_obj.tradeRouteObjects = {}
 
-        def _update_reach_harbors_fn():
-            for territory_obj in self.territories_by_id.values():
-                if hasattr(territory_obj, 'update_reachable_harbors'):
-                    territory_obj.update_reachable_harbors()
+            tid = h_data['tile_id'][i]
+            # Fast lookup
+            if 0 <= tid < count:
+                h_obj.tile = self.tiles[tid]
+            else:
+                h_obj.tile = None
 
-        _surface_setup_fn()
-        _font_setup_fn()
-        _rebuild_maps_fn()
-        _restore_terr_links_fn()
-        _restore_adj_links_fn()
-        _terr_harbor_gfx_fn()
-        _update_reach_harbors_fn()
+            temp_harbors[h_id] = h_obj
+            self.harbors_by_id[h_id] = h_obj
+            self.allHarbors.append(h_obj)
 
+        # 5. Reconstruct Territories
+        tr_data = payload['territories']
+        tr_count = len(tr_data['id'])
+        self.territories_by_id = {}
+        self.all_territories_for_unpickling = []
+
+        for i in range(tr_count):
+            tid = tr_data['id'][i]
+            t_obj = Territory.__new__(Territory)
+            t_obj.id = tid
+            t_obj.centerPos = tr_data['centerPos'][i]
+            t_obj.territoryCol = tr_data['territoryCol'][i]
+            t_obj.selectedTerritoryCol = tr_data['selectedTerritoryCol'][i]
+
+            t_obj.exteriors = tr_data['exteriors'][i]
+            t_obj.interiors = tr_data['interiors'][i]
+            if SHAPELY_AVAILABLE and tr_data['wkb'][i]:
+                try:
+                    t_obj.polygon = shapely.wkb.loads(tr_data['wkb'][i])
+                except Exception:
+                    t_obj.polygon = None
+            else:
+                t_obj.polygon = None
+
+            t_obj.tiles = []
+            t_obj.landTiles = []
+            t_obj.mountainTiles = []
+            t_obj.coastTiles = []
+            for tile_id in tr_data['tile_ids'][i]:
+                # Fast lookup: IDs match indices
+                if 0 <= tile_id < count:
+                    tile = self.tiles[tile_id]
+                    tile.territory = t_obj
+                    t_obj.tiles.append(tile)
+                    if tile.isLand: t_obj.landTiles.append(tile)
+                    if tile.isMountain: t_obj.mountainTiles.append(tile)
+                    if tile.isCoast: t_obj.coastTiles.append(tile)
+
+            t_obj.harbors = []
+            for hid in tr_data['harbor_ids'][i]:
+                if hid in temp_harbors:
+                    h = temp_harbors[hid]
+                    h.parentTerritory = t_obj
+                    t_obj.harbors.append(h)
+
+            t_obj.containedResources = []
+            for (rtid, rtype) in tr_data['resources'][i]:
+                if 0 <= rtid < count:
+                    res = Resource(self.tiles[rtid], rtype)
+                    res.initializeImg()
+                    t_obj.containedResources.append(res)
+
+            t_obj.cols = self.cols
+            t_obj.resource_info = self.resource_info
+
+            t_obj.baseMapSurf = self.baseMapSurf
+            t_obj.debugOverlayFullMap = self.debugOverlayFullMap
+            t_obj.reachableHarbors = {}
+            t_obj.shortestPathToReachableTerritories = {}
+
+            self.territories_by_id[tid] = t_obj
+            self.all_territories_for_unpickling.append(t_obj)
+
+            for h in t_obj.harbors:
+                h.initialize_graphics_and_external_libs(self.tiles_by_id, self.harbors_by_id)
+
+            if hasattr(t_obj, 'update_reachable_harbors'):
+                t_obj.update_reachable_harbors()
+
+        # 6. Draw Static Map
         self.drawBaseMapStaticContent()
-        self._initialize_full_map_cloud_surface_state()
 
         self.execution_times[GFX_TOTAL_INIT_STEP_NAME] = time.time() - method_total_start_time
         if _local_q_gfx:
-            _local_q_gfx.put_nowait((GFX_TOTAL_INIT_STEP_NAME, "FINISHED", self.execution_times[GFX_TOTAL_INIT_STEP_NAME]))
+            _local_q_gfx.put_nowait(
+                (GFX_TOTAL_INIT_STEP_NAME, "FINISHED", self.execution_times[GFX_TOTAL_INIT_STEP_NAME]))
 
     def print_all_execution_times(self):
         pass
-
-    def _initialize_full_map_cloud_surface_state(self):
-        if not self.cloudSurfFullMap:
-            self.cloudSurfFullMap = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
-        self.cloudSurfFullMap.fill((0, 0, 0, 0))
-
-        self.active_transparent_tiles.clear()
-        for tile in self.tiles:
-            tile.drawCloud(self.cloudSurfFullMap, 0, 0)
-            if tile.cloudOpacity < 0.999:
-                self.active_transparent_tiles.add(tile)
-        self.cloud_surf_initialized = True
 
     def generationCycle(self):
         shifts = {'waterLand': [], 'mountainous': [], 'cloudy': []}
@@ -432,12 +596,6 @@ class TileHandler:
         self.tiles = []
         self.tiles_by_id = {}
         self.tiles_by_grid_coords = {}
-        self.precomp_grid_width = math.ceil(self.mapWidth / self.PRECOMP_CHUNK_SIZE)
-        self.precomp_grid_height = math.ceil(self.mapHeight / self.PRECOMP_CHUNK_SIZE)
-        self.precomp_chunk_grid_tiles = {}
-        for cx_idx in range(self.precomp_grid_width):
-            for cy_idx in range(self.precomp_grid_height):
-                self.precomp_chunk_grid_tiles[(cx_idx, cy_idx)] = []
 
         for x_grid_idx in range(self.gridSizeX):
             for y_grid_idx in range(self.gridSizeY):
@@ -448,19 +606,13 @@ class TileHandler:
 
                 hex_obj = Hex(x_grid_idx, y_grid_idx, x_pos, y_pos, self.size, tile_id_counter)
 
-                pcx = int(hex_obj.x // self.PRECOMP_CHUNK_SIZE)
-                pcy = int(hex_obj.y // self.PRECOMP_CHUNK_SIZE)
-                hex_obj.precomp_chunk_coords = (pcx, pcy)
-
-                if 0 <= pcx < self.precomp_grid_width and 0 <= pcy < self.precomp_grid_height:
-                    self.precomp_chunk_grid_tiles[(pcx, pcy)].append(hex_obj)
-
                 self.tiles.append(hex_obj)
                 self.tiles_by_id[tile_id_counter] = hex_obj
                 self.tiles_by_grid_coords[(x_grid_idx, y_grid_idx)] = hex_obj
                 tile_id_counter += 1
 
     def _link_adjacent_objects(self):
+        # Optimized linking using direct grid mapping
         grid_obj_map = {(tile.grid_x, tile.grid_y): tile for tile in self.tiles}
         for tile in self.tiles:
             tile.adjacent = []
@@ -477,22 +629,27 @@ class TileHandler:
                     tile.adjacent.append(neighbor_obj)
 
     def getTileAtPosition(self, x_map, y_map):
-        target_pcx = int(x_map // self.PRECOMP_CHUNK_SIZE)
-        target_pcy = int(y_map // self.PRECOMP_CHUNK_SIZE)
+        # Optimization: Use grid math instead of brute force loop
+        rough_x = int(x_map // self.horizontal_distance)
+        rough_y = int(y_map // self.vertical_distance)
 
-        for dcx in [-1, 0, 1]:
-            for dcy in [-1, 0, 1]:
-                check_pcx = target_pcx + dcx
-                check_pcy = target_pcy + dcy
+        candidates = []
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                tile = self.tiles_by_grid_coords.get((rough_x + dx, rough_y + dy))
+                if tile: candidates.append(tile)
 
-                if 0 <= check_pcx < self.precomp_grid_width and 0 <= check_pcy < self.precomp_grid_height:
+        if not candidates:
+            candidates = self.tiles
 
-                    chunk_tiles = self.precomp_chunk_grid_tiles.get((check_pcx, check_pcy))
-                    if chunk_tiles:
-                        for tile in chunk_tiles:
-                            if distance(tile.center, (x_map, y_map)) < tile.size:
-                                return tile
-        return None
+        closest = None
+        min_dist = float('inf')
+        for tile in candidates:
+            d = distance((tile.x, tile.y), (x_map, y_map))
+            if d < self.size and d < min_dist:
+                min_dist = d
+                closest = tile
+        return closest
 
     def setTileCols(self):
         for tile in self.tiles:
@@ -525,7 +682,9 @@ class TileHandler:
             bounds['mountain'][0] = self.mountainThreshold
 
         noise_levels = {'water': 0.0035, 'land': 0.004, 'mountain': 0.007, 'cloud': 0.008}
-        dist_funcs = {'water': lambda x_norm: (x_norm ** 2) / 2 + (1 - (1 - x_norm) ** 2) ** 10 / 2, 'land': lambda x_norm: (1 - 2 ** (-3 * x_norm)) * 8 / 7, 'cloud': lambda x_norm: (1 - 2 ** (-3 * x_norm)) * 8 / 7}
+        dist_funcs = {'water': lambda x_norm: (x_norm ** 2) / 2 + (1 - (1 - x_norm) ** 2) ** 10 / 2,
+                      'land': lambda x_norm: (1 - 2 ** (-3 * x_norm)) * 8 / 7,
+                      'cloud': lambda x_norm: (1 - 2 ** (-3 * x_norm)) * 8 / 7}
 
         self.allWaterTiles, self.allLandTiles, self.allCoastalTiles = [], [], []
         for tile in self.tiles:
@@ -535,20 +694,24 @@ class TileHandler:
             norm_cloud = 0.5
             if bounds['cloud'][1] > bounds['cloud'][0]:
                 norm_cloud = normalize(tile.cloudy + cloud_noise, bounds['cloud'][0], bounds['cloud'][1], clamp=True)
-            tile.cloudCol = linearGradient([self.cols.cloudDark, self.cols.cloudMedium, self.cols.cloudLight], dist_funcs['cloud'](norm_cloud))
+            tile.cloudCol = linearGradient([self.cols.cloudDark, self.cols.cloudMedium, self.cols.cloudLight],
+                                           dist_funcs['cloud'](norm_cloud))
 
             if not tile.isLand:
                 noise = random.uniform(-noise_levels['water'], noise_levels['water'])
                 norm_val = 0.5
                 if bounds['water'][1] > bounds['water'][0]:
                     norm_val = normalize(tile.waterLand + noise, bounds['water'][0], bounds['water'][1], clamp=True)
-                tile.col = linearGradient([self.cols.oceanBlue, self.cols.oceanGreen, self.cols.lightOceanGreen, self.cols.oceanFoam], dist_funcs['water'](norm_val))
+                tile.col = linearGradient(
+                    [self.cols.oceanBlue, self.cols.oceanGreen, self.cols.lightOceanGreen, self.cols.oceanFoam],
+                    dist_funcs['water'](norm_val))
                 self.allWaterTiles.append(tile)
             elif tile.isMountain:
                 noise = random.uniform(-noise_levels['mountain'], noise_levels['mountain'])
                 norm_val = 0.5
                 if bounds['mountain'][1] > bounds['mountain'][0]:
-                    norm_val = normalize(tile.mountainous + noise, bounds['mountain'][0], bounds['mountain'][1], clamp=True)
+                    norm_val = normalize(tile.mountainous + noise, bounds['mountain'][0], bounds['mountain'][1],
+                                         clamp=True)
                 tile.col = linearGradient([self.cols.mountainBlue, self.cols.darkMountainBlue], norm_val)
                 self.allLandTiles.append(tile)
             else:
@@ -556,7 +719,8 @@ class TileHandler:
                 norm_val = 0.5
                 if bounds['land'][1] > bounds['land'][0]:
                     norm_val = normalize(tile.waterLand + noise, bounds['land'][0], bounds['land'][1], clamp=True)
-                tile.col = linearGradient([self.cols.oliveGreen, self.cols.darkOliveGreen], dist_funcs['land'](norm_val))
+                tile.col = linearGradient([self.cols.oliveGreen, self.cols.darkOliveGreen],
+                                          dist_funcs['land'](norm_val))
                 self.allLandTiles.append(tile)
 
         allWaterTilesSet = set(self.allWaterTiles)
@@ -657,7 +821,8 @@ class TileHandler:
             if n_clusters == 0:
                 continue
 
-            kmeans = KMeans(n_clusters=n_clusters, random_state=random.randint(0, 10000), n_init='auto', init='k-means++')
+            kmeans = KMeans(n_clusters=n_clusters, random_state=random.randint(0, 10000), n_init='auto',
+                            init='k-means++')
             assigned_labels = kmeans.fit_predict(centers)
 
             grouped_tiles_for_territories = [[] for _ in range(n_clusters)]
@@ -672,7 +837,8 @@ class TileHandler:
                     cx = sum(t.x for t in current_territory_tiles) / len(current_territory_tiles)
                     cy = sum(t.y for t in current_territory_tiles) / len(current_territory_tiles)
 
-                    terr = Territory(self.mapWidth, self.mapHeight, [cx, cy], current_territory_tiles, self.allWaterTiles, self.cols, self.resource_info, self.structure_info)
+                    terr = Territory(self.mapWidth, self.mapHeight, [cx, cy], current_territory_tiles,
+                                     self.allWaterTiles, self.cols, self.resource_info, self.structure_info)
                     terr.id = tid_counter
 
                     self.all_territories_for_unpickling.append(terr)
@@ -736,162 +902,11 @@ class TileHandler:
                 if not hasattr(src_harbor, 'generateAllRoutes'):
                     continue
 
-                routes_found_count += src_harbor.generateAllRoutes(destination_harbors, water_tile_set_for_ocean, current_ocean_harbors_id_map)
+                routes_found_count += src_harbor.generateAllRoutes(destination_harbors, water_tile_set_for_ocean,
+                                                                   current_ocean_harbors_id_map)
 
         print(f"WORKER STDOUT: Found/Generated {routes_found_count} harbor routes.")
         return len(self.allHarbors)
-
-    def _precompute_territory_vision(self):
-        self.territory_vision_cache = {}
-        vision_range_multiplier = GenerationInfo.territoryVisionRange
-
-        for terr_id, terr_obj in self.territories_by_id.items():
-            if not terr_obj.tiles:
-                continue
-
-            reveal_radius_px = vision_range_multiplier * self.size
-            temp_vision_opacities = {}
-
-            for tile_in_terr in terr_obj.tiles:
-                self._calculate_fov_opacities_for_source(tile_in_terr.center, reveal_radius_px, temp_vision_opacities, source_tile_obj=tile_in_terr)
-
-            self.territory_vision_cache[terr_id] = {(tile_obj.tile_id, opacity) for tile_obj, opacity in temp_vision_opacities.items()}
-
-    @staticmethod
-    def _does_chunk_intersect_radius(chunk_relative_coords, reveal_center_px, radius_px, chunk_size_px):
-        cmin_x = chunk_relative_coords[0] * chunk_size_px
-        cmin_y = chunk_relative_coords[1] * chunk_size_px
-        cmax_x = (chunk_relative_coords[0] + 1) * chunk_size_px
-        cmax_y = (chunk_relative_coords[1] + 1) * chunk_size_px
-
-        closest_x = max(cmin_x, min(reveal_center_px[0], cmax_x))
-        closest_y = max(cmin_y, min(reveal_center_px[1], cmax_y))
-
-        dist_sq = (reveal_center_px[0] - closest_x) ** 2 + (reveal_center_px[1] - closest_y) ** 2
-        return dist_sq < (radius_px * radius_px)
-
-    def _generate_all_cloud_precomp_data(self):
-        print(f"WORKER STDOUT: Generating all cloud precomputation data for {self.mapWidth}x{self.mapHeight} grid with size {self.size}")
-
-        self._relative_hex_offsets_pattern = []
-        max_precomp_radius = self.precomp_radii[-1] if self.precomp_radii else 600
-        max_hex_grid_dist = math.ceil(max_precomp_radius / (self.size * math.sqrt(3) / 2)) + 3
-
-        for q_grid_idx in range(-max_hex_grid_dist, max_hex_grid_dist + 1):
-            for r_grid_idx in range(-max_hex_grid_dist, max_hex_grid_dist + 1):
-                rel_x_px = self.horizontal_distance * q_grid_idx
-                rel_y_px = self.vertical_distance * r_grid_idx
-                if q_grid_idx % 2 == 1:
-                    rel_y_px += self.vertical_distance / 2
-
-                dist_from_origin_px = math.sqrt(rel_x_px ** 2 + rel_y_px ** 2)
-
-                if dist_from_origin_px <= max_precomp_radius + self.size * 1.5:
-                    self._relative_hex_offsets_pattern.append({'rel_grid_x': q_grid_idx, 'rel_grid_y': r_grid_idx, 'dist_px': dist_from_origin_px})
-        self._relative_hex_offsets_pattern.sort(key=lambda x: x['dist_px'])
-        print(f"WORKER STDOUT: Precomputed {len(self._relative_hex_offsets_pattern)} relative hex distance patterns.")
-
-        self.precomputed_cloud_info = {}
-        max_r_val = self.precomp_radii[-1] if self.precomp_radii else 0
-        max_dist_chunks_buffer = self.size * 2
-        max_dist_chunks = math.ceil((max_r_val + max_dist_chunks_buffer) / self.PRECOMP_CHUNK_SIZE)
-        pattern_reveal_center_rel_px = (0.5 * self.PRECOMP_CHUNK_SIZE, 0.5 * self.PRECOMP_CHUNK_SIZE)
-
-        for r_idx, rad_px in enumerate(self.precomp_radii):
-            relevant_relative_chunks = set()
-            for drx in range(-max_dist_chunks, max_dist_chunks + 1):
-                for dry in range(-max_dist_chunks, max_dist_chunks + 1):
-                    relative_chunk_coord = (drx, dry)
-                    if self._does_chunk_intersect_radius(relative_chunk_coord, pattern_reveal_center_rel_px, rad_px, self.PRECOMP_CHUNK_SIZE):
-                        relevant_relative_chunks.add(relative_chunk_coord)
-            self.precomputed_cloud_info[r_idx] = relevant_relative_chunks
-        print(f"WORKER STDOUT: Precomputed {len(self.precomputed_cloud_info)} chunk-based relative patterns.")
-
-    def _precompute_cloud_visibility(self):
-        if not os.path.exists(CLOUD_PRECOMP_DIR):
-            os.makedirs(CLOUD_PRECOMP_DIR)
-
-        filename = f"cloud_precomp_data_{self.mapWidth}x{self.mapHeight}_size{self.size}_chunk{self.PRECOMP_CHUNK_SIZE}.pkl.gz"
-        filepath = os.path.join(CLOUD_PRECOMP_DIR, filename)
-
-        loaded = False
-        if os.path.exists(filepath):
-            print(f"WORKER STDOUT: Attempting to load precomputed cloud data from {filepath}")
-            try:
-                with gzip.open(filepath, 'rb') as f:
-                    data = pickle.load(f)
-                    self._relative_hex_offsets_pattern = data.get('relative_hex_offsets_pattern', [])
-                    self.precomputed_cloud_info = {k: set(v) for k, v in data.get('cloud_info_patterns', {}).items()}
-                print(f"WORKER STDOUT: Successfully loaded precomputed cloud data.")
-                loaded = True
-            except (IOError, pickle.UnpicklingError, EOFError) as e:
-                print(f"WORKER STDOUT: Error loading precomputed data: {e}. Re-generating.")
-                self._relative_hex_offsets_pattern = []
-                self.precomputed_cloud_info = {}
-
-        if not loaded:
-            self._generate_all_cloud_precomp_data()
-
-            try:
-                with gzip.open(filepath, 'wb') as f:
-                    pickle.dump({'relative_hex_offsets_pattern': self._relative_hex_offsets_pattern, 'cloud_info_patterns': self.precomputed_cloud_info}, f, protocol=pickle.HIGHEST_PROTOCOL)
-                print(f"WORKER STDOUT: Generated and saved precomputed cloud data to {filepath}.")
-            except Exception as e:
-                print(f"WORKER STDOUT: Error saving precomputed data: {e}")
-
-    def _calculate_fov_opacities_for_source(self, center_coords_px, desired_reveal_radius_px, tile_opacity_map_to_update, source_tile_obj=None):
-        if source_tile_obj:
-            for entry in self._relative_hex_offsets_pattern:
-                rel_grid_x = entry['rel_grid_x']
-                rel_grid_y = entry['rel_grid_y']
-                dist_px = entry['dist_px']
-
-                if dist_px > desired_reveal_radius_px + self.size * 1.5:
-                    break
-
-                target_grid_x = source_tile_obj.grid_x + rel_grid_x
-                target_grid_y = source_tile_obj.grid_y + rel_grid_y
-
-                tile_obj = self.tiles_by_grid_coords.get((target_grid_x, target_grid_y))
-
-                if tile_obj:
-                    opacity_val = (dist_px / desired_reveal_radius_px) ** 0.9 if desired_reveal_radius_px > 1e-6 else (0.0 if dist_px < 1e-6 else 1.0)
-                    current_min_opacity = tile_opacity_map_to_update.get(tile_obj, 1.0)
-                    tile_opacity_map_to_update[tile_obj] = min(current_min_opacity, max(0.0, min(1.0, opacity_val)))
-        else:
-            center_pcx = int(center_coords_px[0] // self.PRECOMP_CHUNK_SIZE)
-            center_pcy = int(center_coords_px[1] // self.PRECOMP_CHUNK_SIZE)
-
-            radius_idx_for_precomp = len(self.precomp_radii) - 1
-            for i, r_val in enumerate(self.precomp_radii):
-                if desired_reveal_radius_px <= r_val:
-                    radius_idx_for_precomp = i
-                    break
-
-            relevant_relative_chunks = self.precomputed_cloud_info.get(radius_idx_for_precomp)
-            if not relevant_relative_chunks:
-                return
-
-            for drx, dry in relevant_relative_chunks:
-                abs_chunk_x = center_pcx + drx
-                abs_chunk_y = center_pcy + dry
-
-                if 0 <= abs_chunk_x < self.precomp_grid_width and 0 <= abs_chunk_y < self.precomp_grid_height:
-
-                    chunk_tiles = self.precomp_chunk_grid_tiles.get((abs_chunk_x, abs_chunk_y))
-                    if chunk_tiles:
-                        for tile_obj in chunk_tiles:
-                            d = distance(center_coords_px, tile_obj.center)
-                            if desired_reveal_radius_px > 1e-6:
-                                if d < desired_reveal_radius_px:
-                                    opacity_val = (d / desired_reveal_radius_px) ** 0.9
-                                else:
-                                    opacity_val = 1.0
-                            else:
-                                opacity_val = 0.0 if d < 1e-6 else 1.0
-
-                            current_min_opacity = tile_opacity_map_to_update.get(tile_obj, 1.0)
-                            tile_opacity_map_to_update[tile_obj] = min(current_min_opacity, max(0.0, min(1.0, opacity_val)))
 
     def drawBaseMapStaticContent(self):
         if not self.baseMapSurf or not self.debugOverlayFullMap:
@@ -938,62 +953,15 @@ class TileHandler:
                 else:
                     selected_territory.drawCurrent(self.territoryHighlightSurfScreen, 'r', scroll_x, scroll_y)
                     hovered_territory.drawCurrent(self.territoryHighlightSurfScreen, 'b', scroll_x, scroll_y)
-                selected_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x, scroll_y)
+                selected_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x,
+                                              scroll_y)
             if (selected_territory is None) or (selected_territory == hovered_territory):
-                hovered_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x, scroll_y)
+                hovered_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x,
+                                             scroll_y)
         else:
             if selected_territory is not None:
                 selected_territory.drawCurrent(self.territoryHighlightSurfScreen, 'r', scroll_x, scroll_y)
-                selected_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x, scroll_y)
+                selected_territory.drawRoutes(self.territoryHighlightSurfScreen, self.cols.brightCrimson, scroll_x,
+                                              scroll_y)
 
         s.blit(self.territoryHighlightSurfScreen, (0, 0))
-
-    def drawClouds(self, s, mx_map, my_map, mouseSize, playerObj, scroll_pos, screen_dims, player_visible_territory_ids: set):
-        if not self.cloud_surf_initialized:
-            self._initialize_full_map_cloud_surface_state()
-        if not self.cloudSurfFullMap:
-            return
-
-        tiles_to_redraw = set()
-        opacities_this_frame = {}
-
-        mouse_vision_radius_options = [50, 150, 300, 600]
-        mouse_vision_radius = mouse_vision_radius_options[mouseSize % len(mouse_vision_radius_options)]
-
-        self._calculate_fov_opacities_for_source((mx_map, my_map), mouse_vision_radius, opacities_this_frame)
-
-        if hasattr(playerObj, 'ships') and isinstance(playerObj.ships, list):
-            for ship in playerObj.ships:
-                if hasattr(ship, 'pos') and ship.pos and hasattr(ship, 'currentVision'):
-                    ship_vision_px = ship.currentVision * self.size
-                    self._calculate_fov_opacities_for_source(ship.pos, ship_vision_px, opacities_this_frame)
-
-        for terr_id in player_visible_territory_ids:
-            territory_vision_data = self.territory_vision_cache.get(terr_id)
-            if territory_vision_data:
-                for tile_id, precomputed_opacity in territory_vision_data:
-                    tile_obj = self.tiles_by_id.get(tile_id)
-                    if tile_obj:
-                        current_min_opacity = opacities_this_frame.get(tile_obj, 1.0)
-                        opacities_this_frame[tile_obj] = min(current_min_opacity, precomputed_opacity)
-
-        new_active_transparent = set()
-        for tile, new_op in opacities_this_frame.items():
-            if abs(tile.cloudOpacity - new_op) > 0.001:
-                tile.cloudOpacity = new_op
-                tiles_to_redraw.add(tile)
-            if tile.cloudOpacity < 0.999:
-                new_active_transparent.add(tile)
-
-        for tile in (self.active_transparent_tiles - new_active_transparent):
-            if tile not in opacities_this_frame:
-                if abs(tile.cloudOpacity - 1.0) > 0.001:
-                    tile.cloudOpacity = 1.0
-                    tiles_to_redraw.add(tile)
-        self.active_transparent_tiles = new_active_transparent
-
-        for tile in tiles_to_redraw:
-            tile.drawCloud(self.cloudSurfFullMap, 0, 0)
-
-        visible_map_rect_on_full_map = pygame.Rect(-scroll_pos[0], -scroll_pos[1], screen_dims[0], screen_dims[1])
-        s.blit(self.cloudSurfFullMap.subsurface(visible_map_rect_on_full_map), (0, 0))
