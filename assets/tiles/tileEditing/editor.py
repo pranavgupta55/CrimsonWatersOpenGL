@@ -242,6 +242,7 @@ class Editor:
         self.renameTarget = None
         self.userString = ""
         self.isPainting = False
+        self.isErasing = False
 
         # Overlay State
         self.overlayMode = False
@@ -443,6 +444,22 @@ class Editor:
         self.overlayOffset = [0, 0]  # Reset offset when new overlay is selected
         self.toastMsg = f"Overlay: {entry.name}"
         self.toastTimer = 2.0
+
+    def apply_mask_transparency(self, surf, mask):
+        """Set alpha=0 for any pixel where mask has alpha==0.
+           Works in pure python; fast enough for 32x48 tiles.
+        """
+        if surf.get_size() != mask.get_size():
+            surf = pygame.transform.scale(surf, mask.get_size()).convert_alpha()
+
+        w, h = mask.get_size()
+        for y in range(h):
+            for x in range(w):
+                if mask.get_at((x, y))[3] == 0:
+                    # set pixel fully transparent
+                    surf.set_at((x, y), (0, 0, 0, 0))
+        return surf
+
 
     # --- FILE MANAGEMENT ---
     def refreshFileList(self):
@@ -778,6 +795,7 @@ class Editor:
                 if mx < 220 and my < (WINDOW_SIZE[1] - 200):
                     clickedUI = True
 
+                # LEFT BUTTON: start paint (keeps your existing behavior)
                 if event.button == 1 and not clickedUI:
                     if self.tool == TOOL_BRUSH:
                         if not self.isPainting:
@@ -786,11 +804,21 @@ class Editor:
                     else:
                         self.handleToolClick(mx, my)
 
-                if event.button == 3 and self.tool == TOOL_LINE: self.lineStart = None
+                # RIGHT BUTTON: start erase (mirror left-click behavior)
+                if event.button == 3 and not clickedUI:
+                    if self.tool == TOOL_BRUSH:
+                        if not self.isErasing:
+                            self.pushHistory()
+                            self.isErasing = True
+                    elif self.tool == TOOL_LINE:
+                        # existing behavior for right-click with line tool
+                        self.lineStart = None
 
             if event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     self.isPainting = False
+                if event.button == 3:
+                    self.isErasing = False
 
             if event.type == pygame.KEYDOWN:
 
@@ -874,7 +902,7 @@ class Editor:
         scaledActive = pygame.transform.scale(activeSurf, (int(CANVAS_WIDTH * zoom), int(CANVAS_HEIGHT * zoom)))
 
         sx, sy = (22, 0) if self.gapMode else (20, 0)
-        dx, dy = (12, 16) if self.gapMode else (11, 15)
+        dx, dy = (12, 16) if self.gapMode else (10, 14)
 
         neighbors_def = [(sx, sy), (-sx, -sy), (dx, dy), (-dx, dy), (dx, -dy), (-dx, -dy)]
 
@@ -920,18 +948,23 @@ class Editor:
                 # Draw Center Full Surface
                 self.screen.blit(e['scaled'], (destX, destY))
 
-                # Draw Main Pixel Outline (Yellow/Gold)
-                if self.outlinePixels:
-                    for (ox, oy) in self.outlinePixels:
-                        scrX = destX + ox * zoom
-                        scrY = destY + oy * zoom
-                        pygame.draw.rect(self.screen, Theme.outline, (scrX, scrY, math.ceil(zoom), math.ceil(zoom)))
+                # Draw Main Pixel Outline as thin gold lines (like neighbors)
+                # Use getHexOutlinePoints so it matches neighbor rendering style.
+                active_edge_lines = self.getHexOutlinePoints(activeSurf)
+                for (p1, p2) in active_edge_lines:
+                    (p1x, p1y), (p2x, p2y) = (p1, p2)
+                    screen_p1 = (destX + p1x * zoom, destY + p1y * zoom)
+                    screen_p2 = (destX + p2x * zoom, destY + p2y * zoom)
+                    pygame.draw.line(self.screen, Theme.outline, screen_p1, screen_p2,
+                                     2)  # width=2; use 1 for even thinner
+
 
             else:
                 # 1. Draw Neighbor Content (Restored)
                 # We need to scale the raw surface to current zoom
                 neighbor_scaled = pygame.transform.scale(e['surf'],
                                                          (int(CANVAS_WIDTH * zoom), int(CANVAS_HEIGHT * zoom)))
+
                 # Fade it slightly so it doesn't look exactly like the active tile
                 neighbor_scaled.set_alpha(250)
                 self.screen.blit(neighbor_scaled, (destX, destY))
@@ -1091,18 +1124,18 @@ class Editor:
         sw = 30
         cols = 6
         startX = 10
-        startY = WINDOW_SIZE[1] - 200
+        startY = WINDOW_SIZE[1] - 300
 
         # --- PALETTE (Bottom Left) ---
         sw = 30
         cols = 6
         spacing = 35
         startX = 10
-        startY = WINDOW_SIZE[1] - 200
+        startY = WINDOW_SIZE[1] - 300
 
         # Only show up to N colors (keep your original cap if desired)
-        max_colors = 24
-        num_colors = min(len(PALETTE), max_colors)
+        max_colors = 48
+        num_colors = min(len(APOLLO_PALETTE), max_colors)
 
         # compute rows required
         rows = math.ceil(num_colors / cols)
@@ -1112,7 +1145,7 @@ class Editor:
         pygame.draw.rect(self.screen, Theme.bg, pRect, 0, 5)
 
         for i in range(num_colors):
-            c = PALETTE[i]
+            c = APOLLO_PALETTE[i]
             rgba = c if len(c) == 4 else (*c, 255)
             r = pygame.Rect(startX + (i % cols) * spacing, startY + (i // cols) * spacing, sw, sw)
 
