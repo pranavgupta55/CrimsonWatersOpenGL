@@ -137,3 +137,19 @@ PLANNING PROMPT FOR GAME INFO
 PLANNING PROMPT FOR GAME INFO
 PLANNING PROMPT FOR GAME INFO
 PLANNING PROMPT FOR GAME INFO
+
+
+here's the coordinates for hexagons (we'll use indexes starting at (0, 0)):
+first hexagon (imagine this is pushed to the top left of the image as much as possible):
+top edge left = (8, 0)
+top edge right = (11, 0)
+left edge top = (0, 4)
+left edge bottom = (0,13)
+right edge top = (19, 4)
+right edge top = (19, 13)
+bottom edge left = (8, 17)
+bottom edge right = (11, 17)
+then the offsets to the next adjacent hexagon directly to the right are everything shifted 20 to the right in the x axis
+the offsets to the hexagon below and directly to the right are everything shifted by (11, 15)
+the offsets to the hexagon below and directly to the left are everything shifted by (-11, 15)
+the hexagons then have an additional "depth" piece which is exactly 8 pixels tall.
