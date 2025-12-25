@@ -14,6 +14,7 @@ except ImportError:
 
 from calcs import randomCol, setOpacity
 from locationalObjects import Resource, Harbor
+from controlPanel import VisualAssets
 
 
 class Territory:
@@ -91,6 +92,7 @@ class Territory:
         polys = []
         PRECISION = 8
         for tile in tiles:
+            # Vertices already have SQUASH_FACTOR applied in Hex.calculate_geometry
             if not hasattr(tile, 'floatHexVertices'):
                 continue
             pts = [(round(p[0], PRECISION), round(p[1], PRECISION)) for p in tile.floatHexVertices]
@@ -205,7 +207,9 @@ class Territory:
         if target_surf is None or target_debug_surf is None: return
 
         if hasattr(self.cols, 'dark'):
-            pygame.draw.circle(target_debug_surf, self.cols.dark, self.centerPos, 5, 2)
+            # Draw center point, taking into account 2.5D visual center logic might shift
+            # CenterPos is avg of tile centers, so it should be correct
+            pygame.draw.circle(target_debug_surf, self.cols.dark, (int(self.centerPos[0]), int(self.centerPos[1])), 5, 2)
 
         borderCol = setOpacity(self.cols.dark, 180)
         borderWidth = 3

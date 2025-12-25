@@ -101,7 +101,7 @@ class VisualAssets:
             'mountain': ('mountains', 'mountains1.png'),
             'pine': ('pine', 'pine1.png'),
             'iron': ('iron', 'iron1.png'),
-            'amber': ('amber', 'amber1.png'),
+            'amber': ('amber', 'defaultTileImg.png'),
             'default': ('defaultTileImg', 'defaultTileImg.png')
         }
 

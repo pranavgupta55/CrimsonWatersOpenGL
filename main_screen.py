@@ -23,7 +23,7 @@ from visual_config import *
 # --- GAME IMPORTS ---
 from text import drawText
 from fontDict import fonts as fonts_definitions
-from controlPanel import GenerationInfo, ResourceInfo, StructureInfo, Cols, uiInfo
+from controlPanel import GenerationInfo, ResourceInfo, StructureInfo, Cols, uiInfo, VisualAssets
 from player import Player
 from calcs import normalize
 
@@ -1156,19 +1156,33 @@ if __name__ == "__main__":
             momentum[idx] += diff / 25
             momentum[idx] *= 0.7
             scroll[idx] += momentum[idx]
-            scroll[idx] = min(max(scroll[idx], [min_scroll_x - scrollBufferSize, min_scroll_y - scrollBufferSize][idx]), [max_scroll_x + scrollBufferSize, max_scroll_y + scrollBufferSize][idx])
+            scroll[idx] = min(max(scroll[idx], [min_scroll_x - scrollBufferSize, min_scroll_y - scrollBufferSize][idx]),
+                              [max_scroll_x + scrollBufferSize, max_scroll_y + scrollBufferSize][idx])
 
         adjustedMx, adjustedMy = [mx - scroll[0], my - scroll[1]]
-        tile_under_mouse = TH.getTileAtPosition(adjustedMx, adjustedMy)
+
+        # New Mouse Picking using Hit Mask
+        tile_under_mouse = None
+        if TH.hitMaskSurf:
+            try:
+                # Need to check bounds first to avoid crash
+                if 0 <= int(adjustedMx) < TH.mapWidth and 0 <= int(adjustedMy) < TH.mapHeight:
+                    # Get color at pixel
+                    col = TH.hitMaskSurf.get_at((int(adjustedMx), int(adjustedMy)))
+
+                    if col.a > 0:  # If we hit a tile mask (not transparent void)
+                        # Decode ID (RGB to int)
+                        picked_id = col.r + (col.g << 8) + (col.b << 16)
+                        tile_under_mouse = TH.tiles_by_id.get(picked_id)
+            except IndexError:
+                pass  # Mouse off map
 
         hovered_territory = None
         if tile_under_mouse and tile_under_mouse.territory_id != -1:
             potential_hovered_terr = TH.territories_by_id.get(tile_under_mouse.territory_id)
-            if potential_hovered_terr and hasattr(potential_hovered_terr, 'polygon') and potential_hovered_terr.polygon:
-                from shapely.geometry import Point
-
-                if Point(adjustedMx, adjustedMy).intersects(potential_hovered_terr.polygon):
-                    hovered_territory = potential_hovered_terr
+            # Hover check logic for territory is now just "if mouse is over tile in territory"
+            # because mouse picking is pixel perfect for tiles.
+            hovered_territory = potential_hovered_terr
 
         player.handleClick(click, dt, hovered_territory)
         player.update(dt)

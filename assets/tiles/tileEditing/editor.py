@@ -22,6 +22,7 @@ except ImportError:
         (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
         (255, 0, 255), (0, 255, 255), (255, 255, 255), (128, 128, 128)
     ]
+    APOLLO_PALETTE = PALETTE  # Fallback if specific palette missing
 
 
     # Simple mask function mock if utils missing
@@ -237,19 +238,26 @@ class Editor:
         self.activeEntry = None
         self.files = []
         self.neighborMap = {}
-        self.neighborCache = {}  # Caches the edge pixels: {filename: [(x,y), ...]}
+        self.neighborCache = {}
+
+        # --- TYPING STATE (Matches main_screen.py logic) ---
         self.typingMode = False
         self.renameTarget = None
         self.userString = ""
+        self.shiftPressed = False
+        self.keyHoldFrames = {}
+        self.delayThreshold = 10
+
+        # --- PAINT STATE ---
         self.isPainting = False
         self.isErasing = False
 
         # Overlay State
         self.overlayMode = False
-        self.overlaySurf = None  # Surface for the currently selected overlay image
-        self.overlayOffset = [0, 0]  # Offset for the overlay
+        self.overlaySurf = None
+        self.overlayOffset = [0, 0]
         self.overlayOpacity = 0.3
-        self.overlayOriginal = None  # Original surface of the selected overlay image
+        self.overlayOriginal = None
 
         # Toast Notification
         self.toastMsg = ""
@@ -258,7 +266,7 @@ class Editor:
         # --- TOOLS ---
         self.tool = TOOL_BRUSH
         self.gapMode = False
-        self.gridVisible = True
+        self.gridVisible = False
         self.showDepth = True
 
         # --- UNDO/REDO ---
@@ -291,26 +299,17 @@ class Editor:
             self.createNewFile()
 
     def generatePixelOutline(self):
-        """
-        Iterates through the mask and finds pixels that are on the edge.
-        Returns a list of (x,y) coordinates.
-        """
         pixels = []
         w, h = CANVAS_WIDTH, CANVAS_HEIGHT
-
-        # We assume 0,0 is top left.
         for y in range(h):
             for x in range(w):
                 if isPointInMask(x, y, self.maskSurf):
-                    # Check 4 neighbors
                     is_border = False
                     for nx, ny in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]:
-                        # If neighbor is out of bounds OR not in mask, this is a border pixel
                         if nx < 0 or ny < 0 or nx >= w or ny >= h:
                             is_border = True
                         elif not isPointInMask(nx, ny, self.maskSurf):
                             is_border = True
-
                     if is_border:
                         pixels.append((x, y))
         return pixels
@@ -327,12 +326,12 @@ class Editor:
         SIDE_MARGIN = (RIGHT_PANEL_W - BTN_W) // 2
 
         anchorX = WINDOW_SIZE[0] - RIGHT_PANEL_W + SIDE_MARGIN
-        currentY = 100  # Start below file list title area
+        currentY = 100
 
         # --- SAVE BUTTON (Explicit) ---
         self.btnSave = Button(anchorX, currentY, BTN_W, BTN_H, "SAVE (Esc)", self.saveAll, col=Theme.btn_idle)
         self.buttons.append(self.btnSave)
-        currentY += BTN_H + BTN_GAP * 2  # Extra spacer
+        currentY += BTN_H + BTN_GAP * 2
 
         # --- TOOLS ---
         self.btnBrush = Button(anchorX, currentY, BTN_W, BTN_H, "BRUSH (B)", lambda: self.setTool(TOOL_BRUSH),
@@ -346,7 +345,7 @@ class Editor:
 
         self.btnLine = Button(anchorX, currentY, BTN_W, BTN_H, "LINE (L)", lambda: self.setTool(TOOL_LINE), toggle=True)
         self.buttons.append(self.btnLine)
-        currentY += BTN_H + BTN_GAP * 2  # Extra spacer
+        currentY += BTN_H + BTN_GAP * 2
 
         # --- VIEW SETTINGS ---
         self.btnGap = Button(anchorX, currentY, BTN_W, BTN_H, "GAP (G)", self.toggleGap, toggle=True)
@@ -371,7 +370,7 @@ class Editor:
         # Slider for Opacity
         self.sldOpacity = Slider(anchorX, currentY, BTN_W, 10, 0.0, 1.0, self.overlayOpacity, self.setOverlayOpacity)
         self.sliders.append(self.sldOpacity)
-        currentY += 15 + BTN_GAP  # Add space for slider
+        currentY += 15 + BTN_GAP
 
         # --- NEW FILE BUTTON (Top Left) ---
         self.btnNew = Button(10, 50, 200, 30, "+ NEW TILE", self.createNewFile, col=Theme.accent)
@@ -403,9 +402,9 @@ class Editor:
         self.overlayMode = not self.overlayMode
         self.btnOverlay.active = self.overlayMode
         if not self.overlayMode:
-            self.overlaySurf = None  # Clear overlay surface when turned off
+            self.overlaySurf = None
             self.overlayOriginal = None
-            self.overlayOffset = [0, 0]  # Reset offset
+            self.overlayOffset = [0, 0]
             self.toastMsg = "Overlay OFF"
             self.toastTimer = 1.0
         else:
@@ -417,13 +416,8 @@ class Editor:
 
     def setOverlay(self, entry):
         if not entry.surface: return
-
-        # 1. Scale DOWN immediately to canvas size.
-        # This prevents performance lag with large images.
         surf = pygame.transform.scale(entry.surface, (CANVAS_WIDTH, CANVAS_HEIGHT))
         w, h = surf.get_size()
-
-        # 2. Determine Colorkey (Winner of 4 corners) on the scaled surface
         corners = [
             surf.get_at((0, 0)),
             surf.get_at((w - 1, 0)),
@@ -432,34 +426,14 @@ class Editor:
         ]
         valid_corners = [c for c in corners if c.a > 0]
         if not valid_corners: valid_corners = [(0, 0, 0, 0)]
-
         c_tuples = [tuple(c) for c in valid_corners]
         most_common = Counter(c_tuples).most_common(1)[0][0]
-
-        # 3. Apply Colorkey and set as overlay
         surf.set_colorkey(most_common)
-
-        self.overlayOriginal = surf  # This is now small (e.g. 32x48)
+        self.overlayOriginal = surf
         self.overlaySurf = surf
-        self.overlayOffset = [0, 0]  # Reset offset when new overlay is selected
+        self.overlayOffset = [0, 0]
         self.toastMsg = f"Overlay: {entry.name}"
         self.toastTimer = 2.0
-
-    def apply_mask_transparency(self, surf, mask):
-        """Set alpha=0 for any pixel where mask has alpha==0.
-           Works in pure python; fast enough for 32x48 tiles.
-        """
-        if surf.get_size() != mask.get_size():
-            surf = pygame.transform.scale(surf, mask.get_size()).convert_alpha()
-
-        w, h = mask.get_size()
-        for y in range(h):
-            for x in range(w):
-                if mask.get_at((x, y))[3] == 0:
-                    # set pixel fully transparent
-                    surf.set_at((x, y), (0, 0, 0, 0))
-        return surf
-
 
     # --- FILE MANAGEMENT ---
     def refreshFileList(self):
@@ -485,15 +459,20 @@ class Editor:
         self.files.insert(0, newEntry)
         self.switchFile(newEntry)
 
+        # --- Automatically Enter Typing Mode for Rename ---
+        self.typingMode = True
+        self.renameTarget = newEntry
+        self.userString = ""  # Start with empty string
+        self.keyHoldFrames = {}  # Reset inputs
+
     def switchFile(self, entry):
         if self.activeEntry: self.commitCanvasToEntry()
         self.activeEntry = entry
         self.initCanvas(entry.surface)
         self.neighborMap = {}
-        self.neighborCache = {}  # Clear cache
+        self.neighborCache = {}
         self.history = []
         self.redoStack = []
-        # Reset overlay state when switching files
         self.overlayMode = False
         self.btnOverlay.active = False
         self.overlaySurf = None
@@ -590,43 +569,35 @@ class Editor:
         return None
 
     def getHexOutlinePoints(self, surf):
-        """
-        Generates a list of line segments (start_point, end_point) for the outer edges
-        of the visible pixels in the surface, forming a continuous outline.
-        """
         lines = []
         w, h = surf.get_size()
-        pixels_in_mask = set()  # Store (x,y) of pixels that are part of the shape
+        pixels_in_mask = set()
 
-        # First, identify all pixels that are part of the shape
         for y in range(h):
             for x in range(w):
-                if surf.get_at((x, y))[3] > 0:  # Check if pixel is not fully transparent
+                if surf.get_at((x, y))[3] > 0:
                     pixels_in_mask.add((x, y))
 
-        # Then, find edge pixels and generate line segments
         for x, y in pixels_in_mask:
-            # Check neighbors
             for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                 nx, ny = x + dx, y + dy
-                # If a neighbor is out of bounds or not part of the shape, this pixel has an edge here
                 if (nx, ny) not in pixels_in_mask:
                     mid_x, mid_y, edge_dx, edge_dy = 0, 0, 0, 0
-                    if dx == 1:  # right edge
-                        mid_x = x + 1
-                        mid_y = y + 0.5
+                    if dx == 1:
+                        mid_x = x + 1;
+                        mid_y = y + 0.5;
                         edge_dx, edge_dy = 0, 1
-                    elif dx == -1:  # left edge
-                        mid_x = x
-                        mid_y = y + 0.5
+                    elif dx == -1:
+                        mid_x = x;
+                        mid_y = y + 0.5;
                         edge_dx, edge_dy = 0, 1
-                    elif dy == 1:  # bottom edge
-                        mid_x = x + 0.5
-                        mid_y = y + 1
+                    elif dy == 1:
+                        mid_x = x + 0.5;
+                        mid_y = y + 1;
                         edge_dx, edge_dy = 1, 0
-                    elif dy == -1:  # top edge
-                        mid_x = x + 0.5
-                        mid_y = y
+                    elif dy == -1:
+                        mid_x = x + 0.5;
+                        mid_y = y;
                         edge_dx, edge_dy = 1, 0
 
                     half = 0.5
@@ -687,7 +658,33 @@ class Editor:
         if self.toastTimer > 0:
             self.toastTimer -= dt
 
-        if self.typingMode: return
+        # --- Continuous Input with Delay (Adapted from main_screen.py) ---
+        if self.typingMode:
+            for key, hold_time in list(self.keyHoldFrames.items()):
+                self.keyHoldFrames[key] += 1
+                if hold_time == 0 or hold_time > self.delayThreshold:
+                    if key == pygame.K_BACKSPACE:
+                        if self.userString:
+                            self.userString = self.userString[:-1]
+                    elif key == pygame.K_SPACE:
+                        self.userString += " "
+                    elif pygame.K_0 <= key <= pygame.K_9:
+                        self.userString += chr(key)
+                    elif pygame.K_a <= key <= pygame.K_z:
+                        char = chr(key - 32) if self.shiftPressed else chr(key)
+                        self.userString += char
+                    # Note: Added support for underscore/dash for filenames
+                    elif key == pygame.K_MINUS:
+                        char = "_" if self.shiftPressed else "-"
+                        self.userString += char
+
+                    # Reset the delay counter after an action
+                    if hold_time > self.delayThreshold:
+                        self.keyHoldFrames[key] = self.delayThreshold
+
+            # Skip normal camera updates if typing
+            return
+
         keys = pygame.key.get_pressed()
         moveSpeed = CAMERA_SPEED
         if keys[pygame.K_LSHIFT]: moveSpeed *= 3
@@ -753,21 +750,31 @@ class Editor:
                 pygame.quit()
                 sys.exit()
 
+            # --- KEY INPUT FOR TYPING (Replaces event.unicode) ---
             if self.typingMode:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_RETURN:
+                        # Finalize rename
                         if self.renameTarget and self.userString:
                             newName = self.userString + ".png"
                             if newName == self.renameTarget.name or not any(f.name == newName for f in self.files):
                                 self.renameTarget.name = newName
                                 self.renameTarget.isModified = True
                         self.typingMode = False
+                        self.keyHoldFrames.clear()
                     elif event.key == pygame.K_ESCAPE:
                         self.typingMode = False
-                    elif event.key == pygame.K_BACKSPACE:
-                        self.userString = self.userString[:-1]
-                    else:
-                        if event.unicode.isprintable(): self.userString += event.unicode
+                        self.keyHoldFrames.clear()
+                    elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
+                        self.shiftPressed = True
+                    elif event.key not in self.keyHoldFrames:  # Start tracking
+                        self.keyHoldFrames[event.key] = 0
+
+                if event.type == pygame.KEYUP:
+                    if event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
+                        self.shiftPressed = False
+                    self.keyHoldFrames.pop(event.key, None)  # Stop tracking
+
                 continue
 
             if event.type == pygame.MOUSEWHEEL:
@@ -795,7 +802,7 @@ class Editor:
                 if mx < 220 and my < (WINDOW_SIZE[1] - 200):
                     clickedUI = True
 
-                # LEFT BUTTON: start paint (keeps your existing behavior)
+                # LEFT BUTTON: start paint
                 if event.button == 1 and not clickedUI:
                     if self.tool == TOOL_BRUSH:
                         if not self.isPainting:
@@ -804,14 +811,13 @@ class Editor:
                     else:
                         self.handleToolClick(mx, my)
 
-                # RIGHT BUTTON: start erase (mirror left-click behavior)
+                # RIGHT BUTTON: start erase
                 if event.button == 3 and not clickedUI:
                     if self.tool == TOOL_BRUSH:
                         if not self.isErasing:
                             self.pushHistory()
                             self.isErasing = True
                     elif self.tool == TOOL_LINE:
-                        # existing behavior for right-click with line tool
                         self.lineStart = None
 
             if event.type == pygame.MOUSEBUTTONUP:
@@ -821,14 +827,11 @@ class Editor:
                     self.isErasing = False
 
             if event.type == pygame.KEYDOWN:
-
-                # ESC -> Save + Exit
                 if event.key == pygame.K_ESCAPE:
                     self.saveAll()
                     pygame.quit()
                     sys.exit()
 
-                # CMD + S (Mac)  OR  CTRL + S (Windows/Linux)
                 if event.key == pygame.K_s and (event.mod & pygame.KMOD_META or event.mod & pygame.KMOD_CTRL):
                     self.saveAll()
 
@@ -855,13 +858,13 @@ class Editor:
 
     def draw(self):
         self.screen.fill(Theme.bg)
-        self.drawBackgroundCheckerboard()  # Draw checkerboard first
+        self.drawBackgroundCheckerboard()
         self.drawPainter()
         self.drawUI()
         self.drawToast()
 
         mx, my = pygame.mouse.get_pos()
-        if mx > 220 and mx < (WINDOW_SIZE[0] - 180):  # Between panels
+        if mx > 220 and mx < (WINDOW_SIZE[0] - 180):
             pygame.mouse.set_visible(False)
             pygame.draw.circle(self.screen, Theme.accent, (mx, my), 3)
             pygame.draw.circle(self.screen, Theme.text, (mx, my), 2)
@@ -871,10 +874,9 @@ class Editor:
         pygame.display.flip()
 
     def drawBackgroundCheckerboard(self):
-        checker_size = 32  # Size of each checker square in pixels
+        checker_size = 32
         for y in range(0, WINDOW_SIZE[1], checker_size):
             for x in range(0, WINDOW_SIZE[0], checker_size):
-                # Alternate colors based on grid position
                 if (x // checker_size + y // checker_size) % 2 == 0:
                     color = Theme.bg
                 else:
@@ -933,12 +935,10 @@ class Editor:
             if e['isCenter']:
                 # --- DRAW OVERLAY IF ACTIVE ---
                 if self.overlayMode and self.overlaySurf:
-                    # Scale overlay, apply offset, and then draw with opacity
                     o_w = int(self.overlayOriginal.get_width() * zoom)
                     o_h = int(self.overlayOriginal.get_height() * zoom)
                     o_scaled = pygame.transform.scale(self.overlayOriginal, (o_w, o_h))
 
-                    # Calculate final position including offset and camera
                     overlay_draw_x = destX + self.overlayOffset[0]
                     overlay_draw_y = destY + self.overlayOffset[1]
 
@@ -948,46 +948,37 @@ class Editor:
                 # Draw Center Full Surface
                 self.screen.blit(e['scaled'], (destX, destY))
 
-                # Draw Main Pixel Outline as thin gold lines (like neighbors)
-                # Use getHexOutlinePoints so it matches neighbor rendering style.
-                active_edge_lines = self.getHexOutlinePoints(activeSurf)
-                for (p1, p2) in active_edge_lines:
-                    (p1x, p1y), (p2x, p2y) = (p1, p2)
-                    screen_p1 = (destX + p1x * zoom, destY + p1y * zoom)
-                    screen_p2 = (destX + p2x * zoom, destY + p2y * zoom)
-                    pygame.draw.line(self.screen, Theme.outline, screen_p1, screen_p2,
-                                     2)  # width=2; use 1 for even thinner
-
+                if self.gridVisible:
+                    active_edge_lines = self.getHexOutlinePoints(activeSurf)
+                    for (p1, p2) in active_edge_lines:
+                        (p1x, p1y), (p2x, p2y) = (p1, p2)
+                        screen_p1 = (destX + p1x * zoom, destY + p1y * zoom)
+                        screen_p2 = (destX + p2x * zoom, destY + p2y * zoom)
+                        pygame.draw.line(self.screen, Theme.outline, screen_p1, screen_p2, 2)
 
             else:
-                # 1. Draw Neighbor Content (Restored)
-                # We need to scale the raw surface to current zoom
                 neighbor_scaled = pygame.transform.scale(e['surf'],
                                                          (int(CANVAS_WIDTH * zoom), int(CANVAS_HEIGHT * zoom)))
-
-                # Fade it slightly so it doesn't look exactly like the active tile
                 neighbor_scaled.set_alpha(250)
                 self.screen.blit(neighbor_scaled, (destX, destY))
 
-                # 2. Draw Neighbor Hex Outlines
                 edge_lines = []
                 use_cache = (e['surf'] != activeSurf)
 
                 if use_cache and e['id'] in self.neighborCache:
                     edge_lines = self.neighborCache[e['id']]
                 else:
-                    # Generate outline points for this neighbor surface
                     edge_lines = self.getHexOutlinePoints(e['surf'])
                     if use_cache: self.neighborCache[e['id']] = edge_lines
 
-                # Draw the generated lines for the neighbor
-                for line in edge_lines:
-                    (p1x, p1y), (p2x, p2y) = line
-                    screen_p1 = (destX + p1x * zoom, destY + p1y * zoom)
-                    screen_p2 = (destX + p2x * zoom, destY + p2y * zoom)
-                    pygame.draw.line(self.screen, Theme.neighbor_outline, screen_p1, screen_p2, 2)
+                if self.gridVisible:
+                    for line in edge_lines:
+                        (p1x, p1y), (p2x, p2y) = line
+                        screen_p1 = (destX + p1x * zoom, destY + p1y * zoom)
+                        screen_p2 = (destX + p2x * zoom, destY + p2y * zoom)
+                        pygame.draw.line(self.screen, Theme.neighbor_outline, screen_p1, screen_p2, 2)
 
-            # Draw Center UI (Grid, Highlights) - Only for the center tile
+            # Draw Center UI
             if e['isCenter']:
                 mx, my = pygame.mouse.get_pos()
                 clickL = pygame.mouse.get_pressed()[0]
@@ -997,16 +988,12 @@ class Editor:
                 offY = cy + self.camPos[1] - (CANVAS_HEIGHT * zoom / 2)
 
                 hoveredPixel = None
-
-                # determine hovered pixel by mapping mouse -> grid (independent of grid visibility)
-                hoveredPixel = None
                 if mx > 220 and mx < (WINDOW_SIZE[0] - 180):
                     gx = int((mx - offX) / zoom)
                     gy = int((my - offY) / zoom)
                     if 0 <= gx < CANVAS_WIDTH and 0 <= gy < CANVAS_HEIGHT and isPointInMask(gx, gy, self.maskSurf):
                         hoveredPixel = self.getPixel(gx, gy)
 
-                # draw grid squares only when requested
                 if self.gridVisible and zoom > 4:
                     for p in self.pixels:
                         if isPointInMask(p.gridX, p.gridY, self.maskSurf):
@@ -1014,7 +1001,6 @@ class Editor:
                             ry = offY + p.gridY * zoom
                             pygame.draw.rect(self.screen, (20, 20, 25), (rx, ry, math.ceil(zoom), math.ceil(zoom)), 1)
 
-                # Brush/Tool Highlighting & Action
                 if hoveredPixel:
                     targetPixels = []
                     if self.tool == TOOL_BRUSH:
@@ -1039,7 +1025,6 @@ class Editor:
                     elif self.tool == TOOL_FILL:
                         targetPixels.append(hoveredPixel)
 
-                    # Highlight and perform action
                     for tp in targetPixels:
                         rx = offX + tp.gridX * zoom
                         ry = offY + tp.gridY * zoom
@@ -1052,7 +1037,6 @@ class Editor:
                             tp.c = (0, 0, 0, 0)
                             if self.activeEntry: self.activeEntry.isModified = True
 
-        # Line Preview
         if self.tool == TOOL_LINE and self.lineStart:
             sp = self.getPixel(self.lineStart[0], self.lineStart[1])
             if sp:
@@ -1076,7 +1060,7 @@ class Editor:
 
         bgW = 260
         bgH = len(items) * 20 + 20
-        x = WINDOW_SIZE[0] - 190 - bgW  # Position to left of sidebar
+        x = WINDOW_SIZE[0] - 190 - bgW
         y = WINDOW_SIZE[1] - bgH - 10
 
         pygame.draw.rect(self.screen, Theme.panel, (x, y, bgW, bgH), 0, 10)
@@ -1117,14 +1101,7 @@ class Editor:
         pygame.draw.rect(self.screen, Theme.panel, (rx, 0, rw, WINDOW_SIZE[1]))
         pygame.draw.line(self.screen, Theme.border, (rx, 0), (rx, WINDOW_SIZE[1]), 2)
 
-        # Label for Tools
         drawText(self.screen, Theme.text_dim, self.fontBold, rx + rw // 2, 70, "TOOLS", justify="center")
-
-        # --- PALETTE (Bottom Left) ---
-        sw = 30
-        cols = 6
-        startX = 10
-        startY = WINDOW_SIZE[1] - 300
 
         # --- PALETTE (Bottom Left) ---
         sw = 30
@@ -1133,14 +1110,10 @@ class Editor:
         startX = 10
         startY = WINDOW_SIZE[1] - 300
 
-        # Only show up to N colors (keep your original cap if desired)
         max_colors = 48
         num_colors = min(len(APOLLO_PALETTE), max_colors)
-
-        # compute rows required
         rows = math.ceil(num_colors / cols)
 
-        # Palette Background sized to actual rows
         pRect = pygame.Rect(startX - 5, startY - 5, cols * spacing + 5, rows * spacing + 5)
         pygame.draw.rect(self.screen, Theme.bg, pRect, 0, 5)
 
@@ -1177,7 +1150,6 @@ class Editor:
             if self.drawFileRow(f, y, w, mx, my, click): return
             y += 25
 
-        # Draw Buttons and Sliders
         for b in self.buttons: b.draw(self.screen, self.fontBold)
         for s in self.sliders: s.draw(self.screen)
 
@@ -1206,11 +1178,11 @@ class Editor:
                 else:
                     self.switchFile(f)
 
-            # Enable renaming with right-click only if not in overlay mode
             if isHover and pygame.mouse.get_pressed()[2] and not self.typingMode and not self.overlayMode:
                 self.typingMode = True
                 self.renameTarget = f
                 self.userString = f.name.replace(".png", "")
+                self.keyHoldFrames = {}
 
         col = Theme.text if f == self.activeEntry else Theme.text_dim
         if f.isNew:
