@@ -101,6 +101,7 @@ class Cols:
     darkMountainBlue = [42, 40, 52]
     light = [220, 216, 201]
     dark = [19, 21, 22]
+    veryDark = [5, 8, 10]
     crimson = [94, 32, 47]
     brightCrimson = [85, 42, 56]
     cloudLight = [176, 185, 205]

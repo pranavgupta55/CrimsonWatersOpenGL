@@ -945,7 +945,7 @@ if __name__ == "__main__":
         mx_render = mx * (INT_CLOUD_RENDER_W / WINDOW_WIDTH)
         my_render = (WINDOW_HEIGHT - my) * (INT_CLOUD_RENDER_H / WINDOW_HEIGHT)
 
-        surf_game.fill(Cols.dark)
+        surf_game.fill(Cols.veryDark)
         surf_ui.fill((0, 0, 0, 0))
 
         for event in pygame.event.get():
@@ -1002,7 +1002,7 @@ if __name__ == "__main__":
         player.update(dt)
 
         high_res_view = pygame.Surface((screen_width, screen_height))
-        high_res_view.fill(Cols.dark)
+        high_res_view.fill(Cols.veryDark)
         if TH.baseMapSurf: high_res_view.blit(TH.baseMapSurf, (scroll[0], scroll[1]))
         if debug and TH.debugOverlayFullMap: high_res_view.blit(TH.debugOverlayFullMap, (scroll[0], scroll[1]))
         TH.drawTerritoryHighlights(high_res_view, hovered_territory, player.selectedTerritory, scroll)
