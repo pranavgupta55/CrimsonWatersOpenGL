@@ -11,7 +11,7 @@ from locationalObjects import Resource, Harbor
 import time
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-from controlPanel import GenerationInfo, VisualAssets
+from controlPanel import GenerationInfo, VisualAssets, HexConstants
 import os
 import sys
 
@@ -27,49 +27,46 @@ except ImportError:
 
 class Hex:
     __slots__ = (
-        'grid_x', 'grid_y', 'x', 'y', 'size', 'tile_id', 'col', 'cloudCol',
+        'grid_x', 'grid_y', 'x', 'y', 'tile_id', 'col', 'cloudCol',
         'center', 'hex', 'floatHexVertices',
         'adjacent_tile_ids', 'territory_id', 'adjacent', 'territory',
         'region', 'mountainRegion', 'regionCol',
         'waterLand', 'mountainous', 'cloudy',
         'isLand', 'isMountain', 'isCoast',
         'connectedOceanID', 'cloudOpacity', 'precomp_chunk_coords',
-        'resourceType'
+        'resourceType', 'draw_y_offset', 'size'
     )
 
-    _cached_offsets = {}
-
-    def __init__(self, grid_x, grid_y, x, y, size, tile_id, col=(0, 0, 0), cloudCol=(50, 50, 50)):
+    def __init__(self, grid_x, grid_y, tile_id, col=(0, 0, 0), cloudCol=(50, 50, 50)):
         self.tile_id = tile_id
         self.grid_x = grid_x
         self.grid_y = grid_y
-        self.size = size
         self.col = col
         self.cloudCol = cloudCol
 
-        # 2.5D Projection Calculation
-        # Horizontal (Standard Hex Width = sqrt(3) * size)
-        sq3 = 1.73205080757
-        x_offset = (self.grid_y % 2) * (sq3 * self.size / 2)
-        self.x = (self.grid_x * sq3 * self.size) + x_offset
+        # --- DISCRETE PIXEL MATH (Matching Editor) ---
+        self.x = self.grid_x * HexConstants.WIDTH
+        if self.grid_y % 2 != 0:
+            self.x += HexConstants.WIDTH // 2
+        self.y = self.grid_y * HexConstants.HEIGHT_STEP
 
-        # Vertical (Squashed)
-        # Standard height dist is size * 1.5
-        self.y = (self.grid_y * self.size * 1.5) * VisualAssets.SQUASH_FACTOR
+        # Logic center (visual center of face)
+        self.center = [self.x + HexConstants.WIDTH // 2, self.y + 9]  # 9 is approx half of face height 18
 
-        self.center = [self.x, self.y]
+        # --- COMPATIBILITY ATTRIBUTE ---
+        # LocationalObjects and Ships rely on tile.size for radius-based math
+        # Width = 20. If Width approx 2*size (pointy) or sqrt(3)*size (flat).
+        # We assume 10.0 for logic radius.
+        self.size = 10.0
 
-        # Geometry
         self.calculate_geometry()
 
-        # Relationships
         self.adjacent_tile_ids = []
         self.adjacent = []
         self.territory_id = -1
         self.territory = None
         self.resourceType = None
 
-        # Generation Data
         self.region = None
         self.mountainRegion = None
         self.regionCol = None
@@ -77,69 +74,35 @@ class Hex:
         self.mountainous = random.random()
         self.cloudy = random.random()
 
-        # Flags
         self.isLand = False
         self.isMountain = False
         self.isCoast = False
         self.connectedOceanID = -1
         self.cloudOpacity = 1.0
         self.precomp_chunk_coords = None
+        self.draw_y_offset = 0
 
     def calculate_geometry(self):
-        # We need to apply the squash factor to the vertices so the
-        # territory borders match the 2.5D sprites.
-        if self.size not in Hex._cached_offsets:
-            offsets = []
-            for angle in range(6):
-                # Standard Hex Vertices
-                ox = self.size * math.cos(math.pi / 3 * angle)
-                oy = self.size * math.sin(math.pi / 3 * angle)
+        # Precise polygon coordinates matching Editor for Territory Borders
+        # Top-Left is (self.x, self.y)
+        face_poly = [
+            (8, 0), (11, 0),  # Top
+            (19, 4), (19, 13),  # Right
+            (11, 17), (8, 17),  # Bottom
+            (0, 13), (0, 4)  # Left
+        ]
 
-                # Apply Squash
-                oy *= VisualAssets.SQUASH_FACTOR
-                offsets.append((ox, oy))
-            Hex._cached_offsets[self.size] = offsets
-
-        offsets = Hex._cached_offsets[self.size]
-        self.floatHexVertices = [(self.x + ox, self.y + oy) for ox, oy in offsets]
-        self.hex = [(int(round(p[0])), int(round(p[1]))) for p in self.floatHexVertices]
-
-    @property
-    def bounding_rect(self):
-        if not hasattr(self, 'hex') or not self.hex:
-            self.calculate_geometry()
-        min_x = min(p[0] for p in self.hex)
-        max_x = max(p[0] for p in self.hex)
-        min_y = min(p[1] for p in self.hex)
-        max_y = max(p[1] for p in self.hex)
-        return pygame.Rect(min_x, min_y, max_x - min_x, max_y - min_y)
+        self.hex = [(self.x + p[0], self.y + p[1]) for p in face_poly]
+        self.floatHexVertices = [(float(p[0]), float(p[1])) for p in self.hex]
 
     def draw(self, s):
         # Fallback debug draw
         pygame.draw.polygon(s, self.col, self.hex)
 
-    def drawArrows(self, s, color, scroll_x, scroll_y):
-        if not self.adjacent:
-            return
-        arrow_col = tuple(color) if color else (255, 0, 0)
-        for adj in self.adjacent:
-            angle = normalize_angle(ang((self.x, self.y), (adj.x, adj.y)))
-            dist_val = distance((self.x, self.y), (adj.x, adj.y))
-            factor = 0.35
-            start_pos = (self.x + scroll_x, self.y + scroll_y)
-            end_pos = (self.x + dist_val * factor * math.cos(angle) + scroll_x,
-                       self.y + dist_val * factor * math.sin(angle) + scroll_y)
-            draw_arrow(s, start_pos, end_pos, arrow_col, pygame, 2, 5, 25)
-
-    def showWaterLand(self, s, font, color, scroll_x, scroll_y):
-        if font:
-            text_col = tuple(color) if color else (0, 0, 0)
-            drawText(s, text_col, font, self.x + scroll_x, self.y + scroll_y, f"{self.waterLand:.2f}", justify="center",
-                     centeredVertically=True)
-
 
 class TileHandler:
-    def __init__(self, map_width, map_height, size, cols, waterThreshold=0.51, mountainThreshold=0.51,
+    def __init__(self, target_map_width, target_map_height, size_ignored, cols, waterThreshold=0.51,
+                 mountainThreshold=0.51,
                  territorySize=100, font=None, font_name=None, resource_info=None, structure_info=None,
                  status_queue: multiprocessing.Queue = None, preset_times: dict = None, seed: int = None,
                  viewport_width=0, viewport_height=0):
@@ -159,56 +122,47 @@ class TileHandler:
             np.random.seed(self.seed)
             print(f"WORKER STDOUT: Initialized TileHandler with new random seed: {self.seed}")
 
-        # Do not initialize assets here since workers don't have an active pygame display. this is called
-        # later in reconstruct_from_payload anyway
-        # if not VisualAssets.sprites:
-        #     VisualAssets.load_assets(size)
-
-        self.mapWidth = map_width
-        self.mapHeight = map_height
-        self.viewportWidth = viewport_width
-        self.viewportHeight = viewport_height
         self.cols = cols
         self.font = font
         self.font_name = font_name
         self.resource_info = resource_info
         self.structure_info = structure_info
-        self.size = size
         self.territorySize = territorySize
+        self.waterThreshold = waterThreshold
+        self.mountainThreshold = mountainThreshold
+        self.borderSize = 0
+
+        # Hardcoded size for logic consistency
+        self.size = 10.0
+
+        self.gridSizeX = int(target_map_width / HexConstants.WIDTH)
+        self.gridSizeY = int(target_map_height / HexConstants.HEIGHT_STEP)
+
+        self.mapWidth = self.gridSizeX * HexConstants.WIDTH + (HexConstants.WIDTH // 2)
+        self.mapHeight = self.gridSizeY * HexConstants.HEIGHT_STEP + HexConstants.DEPTH + 20
+
+        self.viewportWidth = viewport_width
+        self.viewportHeight = viewport_height
+
         self.tiles = []
         self.tiles_by_id = {}
         self.tiles_by_grid_coords = {}
         self.territories_by_id = {}
         self.harbors_by_id = {}
         self.contiguousTerritoryIDs = []
-
         self.all_territories_for_unpickling = []
-
         self.oceanTiles = {}
         self._ocean_id_map = {}
         self._ocean_water = {}
-        self.waterThreshold = waterThreshold
-        self.mountainThreshold = mountainThreshold
-        self.borderSize = 0
-        # Grid Size logic needs to remain logical, x/y pos calc handles squash
-        self.horizontal_distance = (math.sqrt(3) * size)
-        self.vertical_distance = (1.5 * size)
-
-        self.gridSizeX = int(self.mapWidth / self.horizontal_distance) - self.borderSize + 1
-        self.gridSizeY = int(
-            self.mapHeight / (self.vertical_distance * VisualAssets.SQUASH_FACTOR)) - self.borderSize + 2
-
         self.allWaterTiles = []
         self.allLandTiles = []
         self.allCoastalTiles = []
-
         self.allHarbors = None
         self.baseMapSurf = None
         self.debugOverlayFullMap = None
         self.territoryHighlightSurfScreen = None
         self.playersSurfScreen = None
         self.hitMaskSurf = None
-
         self._temp_contiguous_territories_objs = None
 
         self.STEP_NAMES = {"TILE_GEN": "tileGen", "LINK_ADJ": "linkAdj", "GEN_CYCLES": "generationCycles",
@@ -219,7 +173,6 @@ class TileHandler:
                            "GFX_TOTAL_INIT": "gfxTotalInit"}
 
     def run_generation_sequence(self):
-        """Runs the full generation pipeline."""
         total_init_start_time_timer = time.time()
         landRegionsRaw_result = None
 
@@ -230,42 +183,23 @@ class TileHandler:
                 self.status_queue.put_nowait((step_full_name, "START", expected_time))
 
             s_time = time.time()
-            print(f"[WORKER DEBUG] Starting {step_key}...")
             result = func_to_run(*args)
-            e_time = time.time()
-            duration = e_time - s_time
-            print(f"[WORKER DEBUG] Finished {step_key} in {duration:.4f}s")
+            duration = time.time() - s_time
+
             self.execution_times[step_full_name] = duration
             if self.status_queue:
                 self.status_queue.put_nowait((step_full_name, "FINISHED", duration))
             return result
 
-        def _threaded_task_wrapper(step_key_for_timing, func_to_run, *args):
-            step_full_name = self.STEP_NAMES[step_key_for_timing]
-            expected_time = self.preset_times.get(step_full_name, 999.0)
-
-            if self.status_queue:
-                self.status_queue.put_nowait((step_full_name, "START", expected_time))
-
-            s_time = time.time()
-            print(f"[WORKER DEBUG] Starting Threaded {step_key_for_timing}...")
-            result = func_to_run(*args)
-            e_time = time.time()
-            duration = e_time - s_time
-            print(f"[WORKER DEBUG] Finished Threaded {step_key_for_timing} in {duration:.4f}s")
-            self.execution_times[step_full_name] = duration
-            if self.status_queue:
-                self.status_queue.put_nowait((step_full_name, "FINISHED", duration))
-            return result
+        def _threaded_task_wrapper(step_key, func, *args):
+            return _run_step_sequential(step_key, func, *args)
 
         internal_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
         _run_step_sequential("TILE_GEN", self.generateTiles)
         _run_step_sequential("LINK_ADJ", self._link_adjacent_objects)
         _run_step_sequential("GEN_CYCLES", lambda: [self.generationCycle() for _ in range(50)])
-
-        set_colors_future = internal_executor.submit(_threaded_task_wrapper, "SET_COLORS", self.setTileCols)
-        set_colors_future.result()
+        _run_step_sequential("SET_COLORS", self.setTileCols)
 
         find_regions_future = internal_executor.submit(_threaded_task_wrapper, "FIND_REGIONS",
                                                        self.findContiguousRegions,
@@ -284,7 +218,6 @@ class TileHandler:
                                                           self.connectTerritoryHarbors)
         connect_harbors_future.result()
 
-        # Helper to tag tiles with resources for visual lookup
         for t in self.tiles:
             if hasattr(t.territory, 'containedResources'):
                 for res in t.territory.containedResources:
@@ -299,9 +232,6 @@ class TileHandler:
                 (self.STEP_NAMES["TOTAL_INIT"], "FINISHED", self.execution_times[self.STEP_NAMES["TOTAL_INIT"]]))
 
     def prepare_payload(self):
-        """
-        Serializes world data into a dictionary of arrays (Structure of Arrays).
-        """
         method_start_time = time.time()
         print("[WORKER] Preparing Payload (Structure of Arrays)...")
 
@@ -324,9 +254,6 @@ class TileHandler:
         soa_tiles = {
             'grid_x': [t.grid_x for t in self.tiles],
             'grid_y': [t.grid_y for t in self.tiles],
-            'x': [t.x for t in self.tiles],
-            'y': [t.y for t in self.tiles],
-            'size': self.size,
             'tile_id': [t.tile_id for t in self.tiles],
             'col': [t.col for t in self.tiles],
             'cloudCol': [t.cloudCol for t in self.tiles],
@@ -358,7 +285,6 @@ class TileHandler:
         for terr in all_terrs:
             res_data = [(r.tile.tile_id, r.resourceType) for r in terr.containedResources]
             soa_territories['resources'].append(res_data)
-
             if SHAPELY_AVAILABLE and terr.polygon:
                 soa_territories['wkb'].append(terr.polygon.wkb)
             else:
@@ -371,10 +297,9 @@ class TileHandler:
         soa_harbors = {
             'id': [h.harbor_id for h in all_harbors_flat],
             'tile_id': [(h.tile.tile_id if h.tile else -1) for h in all_harbors_flat],
-            'parent_id': [(h.parentTerritory.id if h.parentTerritory else -1) for h in all_harbors_flat],
-            'tradeRoutesPoints': [h.tradeRoutesPoints for h in all_harbors_flat],
             'isUsable': [h.isUsable for h in all_harbors_flat],
-            'tradeRoutesData': [h.tradeRoutesData for h in all_harbors_flat]
+            'tradeRoutesData': [h.tradeRoutesData for h in all_harbors_flat],
+            'tradeRoutesPoints': [h.tradeRoutesPoints for h in all_harbors_flat]
         }
 
         payload = {
@@ -390,7 +315,6 @@ class TileHandler:
         }
 
         duration = time.time() - method_start_time
-        print(f"[WORKER] Payload Prep took {duration:.4f}s")
         self.execution_times[self.STEP_NAMES["PREP_PICKLING"]] = duration
         if self.status_queue:
             self.status_queue.put_nowait((self.STEP_NAMES["PREP_PICKLING"], "FINISHED", duration))
@@ -398,15 +322,11 @@ class TileHandler:
         return payload
 
     def reconstruct_from_payload(self, payload, fonts_dict, status_queue=None, preset_times=None):
-        """
-        Reconstructs the TileHandler state on the main thread from the SoA payload.
-        """
         _local_q_gfx = status_queue
         _local_preset_times_gfx = preset_times if preset_times else {}
 
         if not hasattr(self, 'execution_times'):
             self.execution_times = {}
-
         if 'execution_times' in payload:
             self.execution_times.update(payload['execution_times'])
 
@@ -419,18 +339,15 @@ class TileHandler:
         method_total_start_time = time.time()
         print("[MAIN THREAD] Reconstructing World from Payload...")
 
-        # Ensure assets are loaded
         if not VisualAssets.sprites:
-            VisualAssets.load_assets(self.size)
+            VisualAssets.load_assets()
 
-        # 1. Restore Scalars
         self.mapWidth = payload['mapWidth']
         self.mapHeight = payload['mapHeight']
         self.viewportWidth = payload['viewportWidth']
         self.viewportHeight = payload['viewportHeight']
         self.contiguousTerritoryIDs = payload['contiguousTerritoryIDs']
 
-        # 2. Setup Surfaces & Fonts
         self.baseMapSurf = pygame.Surface((self.mapWidth, self.mapHeight)).convert_alpha()
         self.debugOverlayFullMap = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
         self.territoryHighlightSurfScreen = pygame.Surface((self.viewportWidth, self.viewportHeight), pygame.SRCALPHA)
@@ -443,7 +360,6 @@ class TileHandler:
         if self.font_name and self.font_name in fonts_dict:
             self.font = fonts_dict[self.font_name]
 
-        # 3. Reconstruct Tiles
         t_data = payload['tiles']
         count = len(t_data['tile_id'])
         self.tiles = [None] * count
@@ -456,12 +372,10 @@ class TileHandler:
         self._ocean_id_map = {}
         self._ocean_water = {}
 
-        size_const = t_data['size']
         for i in range(count):
             h = Hex(
                 t_data['grid_x'][i], t_data['grid_y'][i],
-                t_data['x'][i], t_data['y'][i],
-                size_const, t_data['tile_id'][i],
+                t_data['tile_id'][i],
                 t_data['col'][i], t_data['cloudCol'][i]
             )
             h.waterLand = t_data['waterLand'][i]
@@ -473,6 +387,12 @@ class TileHandler:
             h.connectedOceanID = t_data['connectedOceanID'][i]
             h.territory_id = t_data['territory_id'][i]
             h.resourceType = t_data['resourceType'][i] if 'resourceType' in t_data else None
+
+            if h.isLand:
+                h.draw_y_offset = HexConstants.LAND_ELEVATION
+                h.calculate_geometry()  # Recalc borders with offset if needed
+            else:
+                h.draw_y_offset = 0
 
             self.tiles[i] = h
             self.tiles_by_id[h.tile_id] = h
@@ -495,7 +415,6 @@ class TileHandler:
 
         self._link_adjacent_objects()
 
-        # 4. Reconstruct Harbors (Temp Store)
         h_data = payload['harbors']
         h_count = len(h_data['id'])
         temp_harbors = {}
@@ -521,7 +440,6 @@ class TileHandler:
             self.harbors_by_id[h_id] = h_obj
             self.allHarbors.append(h_obj)
 
-        # 5. Reconstruct Territories
         tr_data = payload['territories']
         tr_count = len(tr_data['id'])
         self.territories_by_id = {}
@@ -534,7 +452,6 @@ class TileHandler:
             t_obj.centerPos = tr_data['centerPos'][i]
             t_obj.territoryCol = tr_data['territoryCol'][i]
             t_obj.selectedTerritoryCol = tr_data['selectedTerritoryCol'][i]
-
             t_obj.exteriors = tr_data['exteriors'][i]
             t_obj.interiors = tr_data['interiors'][i]
             if SHAPELY_AVAILABLE and tr_data['wkb'][i]:
@@ -574,7 +491,6 @@ class TileHandler:
 
             t_obj.cols = self.cols
             t_obj.resource_info = self.resource_info
-
             t_obj.baseMapSurf = self.baseMapSurf
             t_obj.debugOverlayFullMap = self.debugOverlayFullMap
             t_obj.reachableHarbors = {}
@@ -589,7 +505,6 @@ class TileHandler:
             if hasattr(t_obj, 'update_reachable_harbors'):
                 t_obj.update_reachable_harbors()
 
-        # 6. Draw Static Map
         self.drawBaseMapStaticContent()
 
         self.execution_times[GFX_TOTAL_INIT_STEP_NAME] = time.time() - method_total_start_time
@@ -623,65 +538,64 @@ class TileHandler:
         self.tiles_by_id = {}
         self.tiles_by_grid_coords = {}
 
-        # Calculation logic is moved to Hex init for 2.5D position
-        for x_grid_idx in range(self.gridSizeX):
-            for y_grid_idx in range(self.gridSizeY):
-                # x/y passed here might be redundant if Hex calculates it, but passing placeholder
-                hex_obj = Hex(x_grid_idx, y_grid_idx, 0, 0, self.size, tile_id_counter)
-
+        for x in range(self.gridSizeX):
+            for y in range(self.gridSizeY):
+                hex_obj = Hex(x, y, tile_id_counter)
                 self.tiles.append(hex_obj)
                 self.tiles_by_id[tile_id_counter] = hex_obj
-                self.tiles_by_grid_coords[(x_grid_idx, y_grid_idx)] = hex_obj
+                self.tiles_by_grid_coords[(x, y)] = hex_obj
                 tile_id_counter += 1
 
     def _link_adjacent_objects(self):
-        grid_obj_map = {(tile.grid_x, tile.grid_y): tile for tile in self.tiles}
         for tile in self.tiles:
             tile.adjacent = []
-            if tile.grid_x % 2 == 0:
-                offsets = [(1, 0), (-1, 0), (0, 1), (0, -1), (-1, -1), (1, -1)]
+            if tile.grid_y % 2 == 0:
+                offsets = [(1, 0), (-1, 0), (0, -1), (1, -1), (0, 1), (1, 1)]
             else:
-                offsets = [(1, 0), (-1, 0), (0, 1), (0, -1), (-1, 1), (1, 1)]
+                offsets = [(1, 0), (-1, 0), (-1, -1), (0, -1), (-1, 1), (0, 1)]
 
             for dx, dy in offsets:
-                neighbor_grid_x = tile.grid_x + dx
-                neighbor_grid_y = tile.grid_y + dy
-                neighbor_obj = grid_obj_map.get((neighbor_grid_x, neighbor_grid_y))
-                if neighbor_obj:
-                    tile.adjacent.append(neighbor_obj)
+                nx, ny = tile.grid_x + dx, tile.grid_y + dy
+                neighbor = self.tiles_by_grid_coords.get((nx, ny))
+                if neighbor:
+                    tile.adjacent.append(neighbor)
 
     def getTileAtPosition(self, x_map, y_map):
-        # Optimized grid search
-        # In 2.5D, x dist is horizontal_dist, y dist is vertical_dist * squash
-        rough_x = int(x_map // self.horizontal_distance)
-        rough_y = int(y_map // (self.vertical_distance * VisualAssets.SQUASH_FACTOR))
+        grid_y_approx = int(y_map // HexConstants.HEIGHT_STEP)
+        offset = HexConstants.WIDTH // 2 if grid_y_approx % 2 != 0 else 0
+        grid_x_approx = int((x_map - offset) // HexConstants.WIDTH)
 
         candidates = []
-        for dx in range(-2, 3):
-            for dy in range(-2, 3):
-                tile = self.tiles_by_grid_coords.get((rough_x + dx, rough_y + dy))
-                if tile: candidates.append(tile)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                t = self.tiles_by_grid_coords.get((grid_x_approx + dx, grid_y_approx + dy))
+                if t: candidates.append(t)
 
-        if not candidates:
-            candidates = self.tiles
+        mask = VisualAssets.hit_mask_img
+        if not mask: return candidates[0] if candidates else None
 
-        closest = None
-        min_dist = float('inf')
-        # Simple distance check is okay for rough picking, but main_screen uses hit mask
-        for tile in candidates:
-            d = distance((tile.x, tile.y), (x_map, y_map))
-            if d < self.size * 2 and d < min_dist:
-                min_dist = d
-                closest = tile
-        return closest
+        for t in candidates:
+            draw_x = t.x
+            draw_y = t.y + t.draw_y_offset
+            rel_x = int(x_map - draw_x)
+            rel_y = int(y_map - draw_y)
+            if 0 <= rel_x < mask.get_width() and 0 <= rel_y < mask.get_height():
+                if mask.get_at((rel_x, rel_y))[3] > 0:
+                    return t
+
+        return candidates[0] if candidates else None
 
     def setTileCols(self):
         for tile in self.tiles:
             tile.isLand = (tile.waterLand >= self.waterThreshold)
             tile.isMountain = (tile.isLand and tile.mountainous >= self.mountainThreshold)
 
-        # Noise application for gradient logic still applies for color variation if we wanted to tint sprites
-        # but mostly we just set flags now.
+            if tile.isLand:
+                tile.draw_y_offset = HexConstants.LAND_ELEVATION
+            else:
+                tile.draw_y_offset = 0
+
+        # RESTORED NOISE LOGIC FOR GRADIENT SUPPORT
         value_sets = {'water': [], 'land': [], 'mountain': [], 'cloud': []}
         for t in self.tiles:
             if not t.isLand:
@@ -690,8 +604,7 @@ class TileHandler:
                 value_sets['land'].append(t.waterLand)
             elif t.isMountain:
                 value_sets['mountain'].append(t.mountainous)
-            if hasattr(t, 'cloudy'):
-                value_sets['cloud'].append(t.cloudy)
+            if hasattr(t, 'cloudy'): value_sets['cloud'].append(t.cloudy)
 
         bounds = {}
         for k, v_list in value_sets.items():
@@ -707,7 +620,6 @@ class TileHandler:
         if bounds.get('mountain') and len(bounds['mountain']) == 2:
             bounds['mountain'][0] = self.mountainThreshold
 
-        # Original col logic kept for fallback/minimap/debug
         noise_levels = {'water': 0.0035, 'land': 0.004, 'mountain': 0.007, 'cloud': 0.008}
         dist_funcs = {'water': lambda x_norm: (x_norm ** 2) / 2 + (1 - (1 - x_norm) ** 2) ** 10 / 2,
                       'land': lambda x_norm: (1 - 2 ** (-3 * x_norm)) * 8 / 7,
@@ -750,11 +662,11 @@ class TileHandler:
                                           dist_funcs['land'](norm_val))
                 self.allLandTiles.append(tile)
 
-        allWaterTilesSet = set(self.allWaterTiles)
+        allWaterSet = set(self.allWaterTiles)
         for tile in self.allLandTiles:
             is_coastal_tile = False
             for adj in tile.adjacent:
-                if adj in allWaterTilesSet:
+                if adj in allWaterSet:
                     is_coastal_tile = True
                     break
             if is_coastal_tile:
@@ -771,7 +683,6 @@ class TileHandler:
         current_ocean_id = 0
         while unvisited_water_tiles:
             start_tile = unvisited_water_tiles.pop()
-
             current_ocean_set = {start_tile}
             queue = deque([start_tile])
             visited.add(start_tile)
@@ -800,7 +711,6 @@ class TileHandler:
             for adj in coastTile.adjacent:
                 if adj in allWaterTilesSet and hasattr(adj, 'connectedOceanID') and adj.connectedOceanID != -1:
                     ocean_ids_for_coast_tile.add(adj.connectedOceanID)
-
             if ocean_ids_for_coast_tile:
                 coastTile.connectedOceanID = max(ocean_ids_for_coast_tile)
             else:
@@ -811,7 +721,6 @@ class TileHandler:
         visited = set()
         regions = []
         tilesSet = set(tiles_to_check)
-
         for tile in tiles_to_check:
             if tile not in visited:
                 current_region = []
@@ -836,17 +745,12 @@ class TileHandler:
 
         tid_counter = 0
         for region_tiles in land_regions_list:
-            if not region_tiles:
-                continue
-
+            if not region_tiles: continue
             centers = np.array([(t.x, t.y) for t in region_tiles])
             num_actual_tiles_in_region = len(region_tiles)
-
             n_clusters = max(1, math.ceil(num_actual_tiles_in_region / self.territorySize))
             n_clusters = min(n_clusters, num_actual_tiles_in_region)
-
-            if n_clusters == 0:
-                continue
+            if n_clusters == 0: continue
 
             kmeans = KMeans(n_clusters=n_clusters, random_state=random.randint(0, 10000), n_init='auto',
                             init='k-means++')
@@ -860,14 +764,11 @@ class TileHandler:
             for i in range(n_clusters):
                 if grouped_tiles_for_territories[i]:
                     current_territory_tiles = grouped_tiles_for_territories[i]
-
                     cx = sum(t.x for t in current_territory_tiles) / len(current_territory_tiles)
                     cy = sum(t.y for t in current_territory_tiles) / len(current_territory_tiles)
-
                     terr = Territory(self.mapWidth, self.mapHeight, [cx, cy], current_territory_tiles,
                                      self.allWaterTiles, self.cols, self.resource_info, self.structure_info)
                     terr.id = tid_counter
-
                     self.all_territories_for_unpickling.append(terr)
                     self.territories_by_id[terr.id] = terr
                     region_territory_objects_list.append(terr)
@@ -879,6 +780,7 @@ class TileHandler:
                 self._temp_contiguous_territories_objs.append(region_territory_objects_list)
 
     def connectTerritoryHarbors(self):
+        # RESTORED ORIGINAL LOGIC
         self.allHarbors = []
         for terr_obj in self.all_territories_for_unpickling:
             if hasattr(terr_obj, 'harbors') and isinstance(terr_obj.harbors, list):
@@ -936,80 +838,38 @@ class TileHandler:
         return len(self.allHarbors)
 
     def drawBaseMapStaticContent(self):
-        if not self.baseMapSurf or not self.debugOverlayFullMap:
-            return
+        if not self.baseMapSurf: return
+        self.baseMapSurf.fill(self.cols.oceanBlue)
 
-        base_map_fill_color = (0, 0, 100)
-        if hasattr(self.cols, 'oceanBlue'):
-            base_map_fill_color = self.cols.oceanBlue
-        self.baseMapSurf.fill(base_map_fill_color)
-
-        # 2.5D Sorting: Render Y then X
         sorted_tiles = sorted(self.tiles, key=lambda t: (t.grid_y, t.grid_x))
 
-        # --- PASS 1: GROUND ---
         for tile in sorted_tiles:
             key = VisualAssets.get_ground_sprite(tile)
-            sprite_surf = VisualAssets.get_random_version(key)
-            if sprite_surf:
-                # Center the ground sprite on the tile center
-                # Sprites are already scaled to target_w
-                rect = sprite_surf.get_rect(center=(tile.x, tile.y))
-                self.baseMapSurf.blit(sprite_surf, rect)
-            else:
-                # Fallback to polygon
-                tile.draw(self.baseMapSurf)
+            sprite = VisualAssets.get_random_version(key)
+            if sprite:
+                draw_x = tile.x
+                draw_y = tile.y + tile.draw_y_offset
+                self.baseMapSurf.blit(sprite, (draw_x, draw_y))
 
-        # --- PASS 2: SHADOWS (Placeholder logic, no assets in tree) ---
-        # If shadows existed, they would go here.
+            struct_key = VisualAssets.get_structure_sprite(tile)
+            if struct_key:
+                s_sprite = VisualAssets.get_random_version(struct_key)
+                if s_sprite:
+                    sx = tile.x + (HexConstants.WIDTH - s_sprite.get_width()) // 2
+                    sy = tile.y + tile.draw_y_offset - s_sprite.get_height() + HexConstants.HEIGHT_STEP + 4
+                    self.baseMapSurf.blit(s_sprite, (sx, sy))
 
-        # --- PASS 3: STRUCTURES & TALL TERRAIN ---
-        for tile in sorted_tiles:
-            key = VisualAssets.get_structure_sprite(tile)
-            if key:
-                sprite_surf = VisualAssets.get_random_version(key)
-                if sprite_surf:
-                    # Anchor logic: Bottom Center of sprite to Center of Tile
-                    # But slightly lower because tile center is visual center of squashed hex.
-                    # Usually base sits on tile.
-
-                    # Because we squashed the grid Y, the "bottom" of the tile is visually tile.y + height/2
-                    # The sprite should sit there?
-                    # Typically for isometric, the anchor is bottom-center.
-                    # Let's align bottom-center of sprite to tile.y + (size/2 * squash)?
-                    # Simpler: Align bottom center to tile.y + something
-
-                    # Let's align bottom-center of sprite to tile.y + (self.size * SQUASH_FACTOR)
-                    draw_x = tile.x - (sprite_surf.get_width() / 2)
-                    draw_y = tile.y - sprite_surf.get_height() + (self.size * VisualAssets.SQUASH_FACTOR)
-
-                    self.baseMapSurf.blit(sprite_surf, (draw_x, draw_y))
-
-            # Harbors are locational objects but are static, handle them if visual assets available
-            # Current harbor drawing is in Harbor.draw (polygon). We can leave it there
-            # or try to bake it if we had harbor sprites.
-            # Harbor sprites are not in the tree (harbor_tower.png was planned but not in tree)
-            # Tree has 'structures/woodIcon.png' etc, but those are UI icons.
-            # We stick to structures available in tiles folder (forest, mountains, pine, iron, amber)
-
-        # Hit Mask Generation for pixel perfect picking
         self.hitMaskSurf = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)
-        mask_img = VisualAssets.hit_mask_img
-        if mask_img:
+        mask_base = VisualAssets.hit_mask_img
+        if mask_base:
             for tile in sorted_tiles:
-                # Color code ID
-                # 24 bit ID max
                 r = tile.tile_id & 0xFF
                 g = (tile.tile_id >> 8) & 0xFF
                 b = (tile.tile_id >> 16) & 0xFF
+                c_mask = mask_base.copy()
+                c_mask.fill((r, g, b), special_flags=pygame.BLEND_RGB_MULT)
+                self.hitMaskSurf.blit(c_mask, (tile.x, tile.y + tile.draw_y_offset))
 
-                colored_mask = mask_img.copy()
-                colored_mask.fill((r, g, b), special_flags=pygame.BLEND_RGB_MULT)
-
-                rect = colored_mask.get_rect(center=(tile.x, tile.y))
-                self.hitMaskSurf.blit(colored_mask, rect)
-
-        # Debug Overlay (Territory Borders)
         self.debugOverlayFullMap.fill((0, 0, 0, 0))
         for id_list in self.contiguousTerritoryIDs:
             for tid in id_list:
@@ -1017,26 +877,16 @@ class TileHandler:
                 if terr:
                     terr.drawInternalTerritoryBaseline(self.baseMapSurf, self.debugOverlayFullMap)
 
-        # Draw resources (those not baked into tiles) and harbors
-        # Resources are baked via get_structure_sprite if they are tile-based (forests).
-        # locationalObjects.Resource class draws icons.
-        # We can disable their drawing if they are represented by tiles now.
-        # But 'containedResources' might have specific UI icons.
-        # Let's keep drawInternalStructures but be aware of overlap.
         for id_list in self.contiguousTerritoryIDs:
             for tid in id_list:
                 terr = self.territories_by_id.get(tid)
                 if terr:
-                    # Draw Harbors (Still geometric polygons or icons)
                     for harbor in terr.harbors:
                         harbor.draw(self.baseMapSurf, 0, 0)
 
     def drawTerritoryHighlights(self, s, hovered_territory=None, selected_territory=None, scroll=(0, 0)):
-        if not self.territoryHighlightSurfScreen:
-            return
-
+        if not self.territoryHighlightSurfScreen: return
         self.territoryHighlightSurfScreen.fill((0, 0, 0, 0))
-
         scroll_x, scroll_y = scroll[0], scroll[1]
 
         if hovered_territory:
