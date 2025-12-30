@@ -551,18 +551,26 @@ class TileHandler:
                 tile_id_counter += 1
 
     def _link_adjacent_objects(self):
+        grid_obj_map = {(tile.grid_x, tile.grid_y): tile for tile in self.tiles}
         for tile in self.tiles:
             tile.adjacent = []
+
+            # OFFSETS FOR HORIZONTAL STAGGER (POINTY TOP)
             if tile.grid_y % 2 == 0:
-                offsets = [(1, 0), (-1, 0), (0, -1), (1, -1), (0, 1), (1, 1)]
+                # Even Row (Not Shifted):
+                # Connects to TL (-1,-1), TR (0,-1), L (-1,0), R (1,0), BL (-1,1), BR (0,1)
+                offsets = [(-1, -1), (0, -1), (-1, 0), (1, 0), (-1, 1), (0, 1)]
             else:
-                offsets = [(1, 0), (-1, 0), (-1, -1), (0, -1), (-1, 1), (0, 1)]
+                # Odd Row (Shifted Right +0.5):
+                # Connects to TL (0,-1), TR (1,-1), L (-1,0), R (1,0), BL (0,1), BR (1,1)
+                offsets = [(0, -1), (1, -1), (-1, 0), (1, 0), (0, 1), (1, 1)]
 
             for dx, dy in offsets:
-                nx, ny = tile.grid_x + dx, tile.grid_y + dy
-                neighbor = self.tiles_by_grid_coords.get((nx, ny))
-                if neighbor:
-                    tile.adjacent.append(neighbor)
+                neighbor_grid_x = tile.grid_x + dx
+                neighbor_grid_y = tile.grid_y + dy
+                neighbor_obj = grid_obj_map.get((neighbor_grid_x, neighbor_grid_y))
+                if neighbor_obj:
+                    tile.adjacent.append(neighbor_obj)
 
     def getTileAtPosition(self, x_map, y_map):
         grid_y_approx = int(y_map // HexConstants.HEIGHT_STEP)
@@ -843,7 +851,7 @@ class TileHandler:
 
     def drawBaseMapStaticContent(self):
         if not self.baseMapSurf: return
-        self.baseMapSurf.fill(self.cols.oceanBlue)
+        self.baseMapSurf.fill((0, 0, 0, 0))
 
         sorted_tiles = sorted(self.tiles, key=lambda t: (t.grid_y, t.grid_x))
 
