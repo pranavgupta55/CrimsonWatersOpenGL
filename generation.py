@@ -44,20 +44,20 @@ class Hex:
         self.col = col
         self.cloudCol = cloudCol
 
-        # --- DISCRETE PIXEL MATH (Matching Editor) ---
+        # --- DISCRETE PIXEL MATH (Using Scaled Constants) ---
         self.x = self.grid_x * HexConstants.WIDTH
         if self.grid_y % 2 != 0:
             self.x += HexConstants.WIDTH // 2
         self.y = self.grid_y * HexConstants.HEIGHT_STEP
 
         # Logic center (visual center of face)
-        self.center = [self.x + HexConstants.WIDTH // 2, self.y + 9]  # 9 is approx half of face height 18
+        # Face is roughly 18 * SCALE high.
+        half_face_h = 9 * HexConstants.SPRITE_SCALE
+        self.center = [self.x + HexConstants.WIDTH // 2, self.y + half_face_h]
 
-        # --- COMPATIBILITY ATTRIBUTE ---
-        # LocationalObjects and Ships rely on tile.size for radius-based math
-        # Width = 20. If Width approx 2*size (pointy) or sqrt(3)*size (flat).
-        # We assume 10.0 for logic radius.
-        self.size = 10.0
+        # Keep size for legacy radius logic logic (e.g. ship distances)
+        # Width = 20 * Scale -> Radius approx 10 * Scale
+        self.size = 10.0 * HexConstants.SPRITE_SCALE
 
         self.calculate_geometry()
 
@@ -84,12 +84,14 @@ class Hex:
 
     def calculate_geometry(self):
         # Precise polygon coordinates matching Editor for Territory Borders
-        # Top-Left is (self.x, self.y)
+        # Scaled by SPRITE_SCALE
+        s = HexConstants.SPRITE_SCALE
+
         face_poly = [
-            (8, 0), (11, 0),  # Top
-            (19, 4), (19, 13),  # Right
-            (11, 17), (8, 17),  # Bottom
-            (0, 13), (0, 4)  # Left
+            (8 * s, 0 * s), (11 * s, 0 * s),  # Top
+            (19 * s, 4 * s), (19 * s, 13 * s),  # Right
+            (11 * s, 17 * s), (8 * s, 17 * s),  # Bottom
+            (0 * s, 13 * s), (0 * s, 4 * s)  # Left
         ]
 
         self.hex = [(self.x + p[0], self.y + p[1]) for p in face_poly]
@@ -132,14 +134,16 @@ class TileHandler:
         self.mountainThreshold = mountainThreshold
         self.borderSize = 0
 
-        # Hardcoded size for logic consistency
-        self.size = 10.0
+        # Hardcoded size for logic consistency (Visuals handled by HexConstants)
+        self.size = 10.0 * HexConstants.SPRITE_SCALE
 
         self.gridSizeX = int(target_map_width / HexConstants.WIDTH)
         self.gridSizeY = int(target_map_height / HexConstants.HEIGHT_STEP)
 
         self.mapWidth = self.gridSizeX * HexConstants.WIDTH + (HexConstants.WIDTH // 2)
-        self.mapHeight = self.gridSizeY * HexConstants.HEIGHT_STEP + HexConstants.DEPTH + 20
+        # Add buffer for depth and sprite overhangs
+        self.mapHeight = self.gridSizeY * HexConstants.HEIGHT_STEP + HexConstants.DEPTH + (
+                    20 * HexConstants.SPRITE_SCALE)
 
         self.viewportWidth = viewport_width
         self.viewportHeight = viewport_height
@@ -856,7 +860,8 @@ class TileHandler:
                 s_sprite = VisualAssets.get_random_version(struct_key)
                 if s_sprite:
                     sx = tile.x + (HexConstants.WIDTH - s_sprite.get_width()) // 2
-                    sy = tile.y + tile.draw_y_offset - s_sprite.get_height() + HexConstants.HEIGHT_STEP + 4
+                    sy = tile.y + tile.draw_y_offset - s_sprite.get_height() + HexConstants.HEIGHT_STEP + (
+                                4 * HexConstants.SPRITE_SCALE)
                     self.baseMapSurf.blit(s_sprite, (sx, sy))
 
         self.hitMaskSurf = pygame.Surface((self.mapWidth, self.mapHeight), pygame.SRCALPHA)

@@ -4,15 +4,23 @@ import random
 
 
 class HexConstants:
-    # HARDCODED FROM EDITOR CONFIG
-    # The image width is exactly 20 pixels
-    WIDTH = 20
-    # The vertical step between rows is exactly 14 pixels
-    HEIGHT_STEP = 14
-    # The visual depth of the tile (the 3D part hanging down)
-    DEPTH = 8
-    # Elevation offset for land tiles (negative Y moves up)
-    LAND_ELEVATION = -4
+    # --- GLOBAL SCALAR ---
+    # Change this to 2, 3, 4 etc. to scale the game up while keeping resolution
+    SPRITE_SCALE = 2
+
+    # --- BASE DIMENSIONS (Do not change these, they match the source art) ---
+    _BASE_WIDTH = 20
+    _BASE_HEIGHT_STEP = 14
+    _BASE_TOTAL_HEIGHT = 26  # Face + Depth
+    _BASE_DEPTH = 8
+    _BASE_LAND_ELEVATION = 0
+
+    # --- SCALED DIMENSIONS (Use these in logic) ---
+    WIDTH = _BASE_WIDTH * SPRITE_SCALE
+    HEIGHT_STEP = _BASE_HEIGHT_STEP * SPRITE_SCALE
+    TOTAL_HEIGHT = _BASE_TOTAL_HEIGHT * SPRITE_SCALE
+    DEPTH = _BASE_DEPTH * SPRITE_SCALE
+    LAND_ELEVATION = _BASE_LAND_ELEVATION * SPRITE_SCALE
 
 
 class GenerationInfo:
@@ -24,6 +32,10 @@ class GenerationInfo:
 
     territorySize = 100
     mapSizeScalar = 1.5
+
+    territoryBorderAlpha = 180
+    territoryFillAlpha = 60
+    territoryBorderWidth = 3 * HexConstants.SPRITE_SCALE
 
 
 class ResourceInfo:
@@ -60,7 +72,16 @@ class ShipInfo:
     shipDMGs = {'fluyt': 0, 'carrack': 0, 'cutter': 15, 'corsair': 25, 'longShip': 10, 'galleon': 20}
     shipAttackRanges = {'fluyt': 0, 'carrack': 0, 'cutter': 3, 'corsair': 4, 'longShip': 2, 'galleon': 3}
     shipStorageCapacities = {'fluyt': 150, 'carrack': 200, 'cutter': 0, 'corsair': 0, 'longShip': 100, 'galleon': 250}
-    shipSizes = {'fluyt': 35, 'carrack': 40, 'cutter': 30, 'corsair': 35, 'longShip': 35, 'galleon': 50}
+
+    # Scale ship sizes by the global scalar
+    shipSizes = {
+        'fluyt': 35 * HexConstants.SPRITE_SCALE,
+        'carrack': 40 * HexConstants.SPRITE_SCALE,
+        'cutter': 30 * HexConstants.SPRITE_SCALE,
+        'corsair': 35 * HexConstants.SPRITE_SCALE,
+        'longShip': 35 * HexConstants.SPRITE_SCALE,
+        'galleon': 50 * HexConstants.SPRITE_SCALE
+    }
 
 
 class uiInfo:
@@ -89,8 +110,7 @@ class Cols:
 
 
 class VisualAssets:
-    SQUASH_FACTOR = 0.6  # Kept for compatibility, though dimensions are now hardcoded
-    SPRITE_SCALE = 1.0
+    SQUASH_FACTOR = 0.6  # Kept for compatibility
 
     sprites = {}
     hit_mask_img = None
@@ -99,18 +119,21 @@ class VisualAssets:
     def load_assets(tileSize=None):
         # We ignore tileSize input now, relying on HexConstants
         target_w = HexConstants.WIDTH
+        target_h = HexConstants.TOTAL_HEIGHT
 
         asset_map = {
             'water_deep': ('deepWater', 'deepWater1.png'),
             'water_shallow': ('shallowWater', 'shallowWater1.png'),
             'sand': ('sand', 'sand1.png'),
             'plains': ('plains', 'plains1.png'),
+            'mountain': ('mountains', 'mountains1.png'),
+
             'forest': ('forest', 'forest1.png'),
             'stone': ('stone', 'stone1.png'),
-            'mountain': ('mountains', 'mountains1.png'),
             'pine': ('pine', 'pine1.png'),
             'iron': ('iron', 'iron1.png'),
             'amber': ('amber', 'defaultTileImg.png'),
+
             'default': ('defaultTileImg', 'defaultTileImg.png')
         }
 
@@ -125,12 +148,10 @@ class VisualAssets:
                 if os.path.exists(path):
                     try:
                         img = pygame.image.load(path).convert_alpha()
-                        # If assets are raw pixel art (20px wide), use as is.
-                        # If they are high res, scale them down.
-                        if img.get_width() != target_w:
-                            scale_ratio = target_w / img.get_width()
-                            new_h = int(img.get_height() * scale_ratio)
-                            img = pygame.transform.scale(img, (target_w, new_h))
+                        # --- FIX FOR PATCHY OFFSETS ---
+                        # Force exact dimensions. Do not preserve aspect ratio if source is off by 1px.
+                        if img.get_width() != target_w or img.get_height() != target_h:
+                            img = pygame.transform.scale(img, (target_w, target_h))
                         loaded_versions.append(img)
                     except Exception as e:
                         print(f"Failed to load {filename}: {e}")
@@ -145,53 +166,41 @@ class VisualAssets:
                 if os.path.exists(path):
                     try:
                         img = pygame.image.load(path).convert_alpha()
-                        if img.get_width() != target_w:
-                            scale_ratio = target_w / img.get_width()
-                            new_h = int(img.get_height() * scale_ratio)
-                            img = pygame.transform.scale(img, (target_w, new_h))
+                        if img.get_width() != target_w or img.get_height() != target_h:
+                            img = pygame.transform.scale(img, (target_w, target_h))
                         loaded_versions.append(img)
                     except:
                         pass
 
             VisualAssets.sprites[key] = loaded_versions
 
-        # Generate Hit Mask based on exact editor coordinates for the Face
-        # The face is roughly 18px tall within the 20x26 rect
-        VisualAssets.hit_mask_img = pygame.Surface((HexConstants.WIDTH, 26), pygame.SRCALPHA)
+        # Generate Hit Mask based on SCALED editor coordinates
+        VisualAssets.hit_mask_img = pygame.Surface((target_w, target_h), pygame.SRCALPHA)
+        s = HexConstants.SPRITE_SCALE
 
-        # Exact Face Coordinates from Editor
+        # Exact Face Coordinates from Editor scaled up
         face_poly = [
-            (8, 0), (11, 0),  # Top Edge
-            (19, 4), (19, 13),  # Right Edge
-            (11, 17), (8, 17),  # Bottom Edge
-            (0, 13), (0, 4)  # Left Edge
+            (8 * s, 0 * s), (11 * s, 0 * s),  # Top
+            (19 * s, 4 * s), (19 * s, 13 * s),  # Right
+            (11 * s, 17 * s), (8 * s, 17 * s),  # Bottom
+            (0 * s, 13 * s), (0 * s, 4 * s)  # Left
         ]
         pygame.draw.polygon(VisualAssets.hit_mask_img, (255, 255, 255), face_poly)
 
     @staticmethod
     def get_ground_sprite(tile):
-        # Determine sprite based on noise values (diffusion map)
         if not tile.isLand:
-            # Water: Deep vs Shallow based on diffusion value
-            # waterThreshold is ~0.505.
-            # Lower values are "deeper" (further from land seeds)
             if tile.waterLand < 0.35:
                 return 'water_deep'
             else:
                 return 'water_shallow'
 
         if tile.isMountain:
-            return 'stone'
+            return 'mountain'
 
-            # Land Biomes based on noise
-        # Lower waterLand on land means "dryer" or "higher" depending on interpretation,
-        # but here we use it for biome variation.
-        # waterLand >= 0.505 is land.
         if tile.waterLand < 0.55:
-            return 'sand'  # Beaches
+            return 'sand'
 
-        # Simple noise seeded randomization for forests if no resource present
-        # This keeps some texture variety
         if tile.tile_id % 7 == 0:
             return 'forest'
 
@@ -205,8 +214,6 @@ class VisualAssets:
             if tile.resourceType == 'stone': return 'stone'
             if tile.resourceType == 'iron': return 'iron'
             if tile.resourceType == 'amber': return 'amber'
-        if tile.isMountain:
-            return 'mountain'
         return None
 
     @staticmethod

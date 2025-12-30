@@ -3,7 +3,9 @@ import heapq
 import itertools
 import numpy as np
 import os
-from calcs import isAngleNearMultiple, catmullRomCentripetal
+import math
+from calcs import catmullRomCentripetal
+from controlPanel import HexConstants
 
 
 def normalize_vector_np(v):
@@ -23,13 +25,14 @@ class Resource:
     def initializeImg(self):
         filename = f"assets/structures/{self.resourceType}Icon.png"
         if os.path.exists(filename):
-            imgScalar = 4
-            self.img = pygame.transform.scale(pygame.image.load(filename).convert_alpha(), [self.tile.size * imgScalar] * 2)
+            # Scale icon based on global scalar
+            imgSize = 8 * HexConstants.SPRITE_SCALE
+            self.img = pygame.transform.scale(pygame.image.load(filename).convert_alpha(), (imgSize, imgSize))
             self.imgDims = self.img.get_width(), self.img.get_height()
 
-    def draw(self, s, scroll_x, scroll_y): # scroll_x, scroll_y are added but expected to be 0 for static map elements
+    def draw(self, s, scroll_x, scroll_y):
         if self.img and self.imgDims:
-            s.blit(self.img, (self.tile.x - self.imgDims[0] / 2, self.tile.y - self.imgDims[1] / 2))
+            s.blit(self.img, (self.tile.center[0] - self.imgDims[0] / 2, self.tile.center[1] - self.imgDims[1] / 2))
 
 
 class LightHouse: pass
@@ -70,7 +73,8 @@ class Harbor:
                         path_objects.append(tile_obj)
                         points.append(tile_obj.center)
                     else:
-                        print(f"Warning: Tile ID {tile_id} not found during route reconstruction for Harbor {self.harbor_id}.")
+                        print(
+                            f"Warning: Tile ID {tile_id} not found during route reconstruction for Harbor {self.harbor_id}.")
                         valid_path = False
                         break
                 if valid_path:
@@ -78,15 +82,33 @@ class Harbor:
 
                     popping = []
                     self.prunedPathPoints = []
-                    for i in range(len(points)):
-                        if len(points) > i + 2:
-                            if isAngleNearMultiple(points[i], points[i + 2], 60, 1):
-                                popping.append(i + 1)
-                                self.prunedPathPoints.append(points[i + 1])
-                                continue
+
+                    # Iterate through the points to find collinear segments
+                    for i in range(len(points) - 2):
+                        p1 = points[i]
+                        p2 = points[i + 1]  # The point to potentially prune
+                        p3 = points[i + 2]
+
+                        # Calculate angle of incoming segment
+                        angle1 = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+                        # Calculate angle of outgoing segment
+                        angle2 = math.atan2(p3[1] - p2[1], p3[0] - p2[0])
+
+                        # Calculate difference (handle wrap around PI)
+                        diff = abs(angle1 - angle2)
+                        if diff > math.pi:
+                            diff = 2 * math.pi - diff
+
+                        # If angles are nearly identical, the point p2 is on a straight line between p1 and p3
+                        if diff < 0.05:
+                            popping.append(i + 1)
+                            self.prunedPathPoints.append(p2)
+
                     for pop in reversed(popping):
                         points.pop(pop)
-                    self.tradeRoutesPoints[target_harbor] = catmullRomCentripetal([self.tile.center] + points + [target_harbor.tile.center], 20)[0::2]
+
+                    full_path_points = [self.tile.center] + points + [target_harbor.tile.center]
+                    self.tradeRoutesPoints[target_harbor] = catmullRomCentripetal(full_path_points, 20)[0::2]
 
     def generateAllRoutes(self, other_harbors_in_ocean, waterTilesInOcean, ocean_harbors_by_id_map):
         routes_found_count = 0
@@ -196,7 +218,7 @@ class Harbor:
 
         return routes_found_count
 
-    def draw(self, s, scroll_x, scroll_y): # scroll_x, scroll_y are added but expected to be 0 for static map elements
+    def draw(self, s, scroll_x, scroll_y):
         shifted_hex = [(p[0] + scroll_x, p[1] + scroll_y) for p in self.tile.hex]
         pygame.draw.polygon(s, ((200, 30, 30) if self.isUsable else (100, 10, 10)), shifted_hex)
 
@@ -212,14 +234,13 @@ class Harbor:
 
         shifted_points = [(p[0] + scroll_x, p[1] + scroll_y) for p in points]
 
+        # Scaled line width
+        lineWidth = max(1, int(3 * (HexConstants.SPRITE_SCALE / 2)))
+
         if len(shifted_points) > 1:
-            pygame.draw.lines(s, draw_color, False, shifted_points, 3)
+            pygame.draw.lines(s, draw_color, False, shifted_points, lineWidth)
         if debug:
             if len(shifted_points) > 1:
                 for p in shifted_points:
                     pygame.draw.circle(s, (0, 0, 255), p, 3)
                 pygame.draw.lines(s, (0, 0, 255), False, shifted_points, 2)
-            if len(self.prunedPathPoints) > 1:
-                shifted_pruned_points = [(p[0] + scroll_x, p[1] + scroll_y) for p in self.prunedPathPoints]
-                for p in shifted_pruned_points:
-                    pygame.draw.circle(s, (0, 255, 0), p, 4)
